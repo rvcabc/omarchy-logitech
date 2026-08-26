@@ -1,0 +1,15 @@
+[Unit]
+Description=Logitech device control daemon for the Omarchy shell
+Documentation=file:%h/.config/omarchy/plugins/io.github.rvcabc.logitech/README.md
+
+[Service]
+Type=simple
+ExecStart=%h/.config/omarchy/plugins/io.github.rvcabc.logitech/bin/logi daemon
+Restart=on-failure
+RestartSec=5
+# Holding the HID++ devices open is the whole point; nothing here needs more.
+PrivateTmp=false
+Nice=5
+
+[Install]
+WantedBy=default.target

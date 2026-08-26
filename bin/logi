@@ -1,0 +1,1028 @@
+#!/usr/bin/env python3
+"""Read and control Logitech devices through solaar's HID++ library.
+
+The Omarchy shell plugin drives this; it is also pleasant to use by hand:
+
+    logi list                       # human-readable summary
+    logi status                     # the JSON the panel consumes
+    logi set mx-master-3s dpi 1600
+    logi set g915-x-ls brightness_control 50
+    logi set pro-x sidetone 30
+    logi rgb g915-x-ls static --color 2bb3e6
+    logi theme                      # paint the keyboard in the Omarchy accent
+
+Every command prints one JSON object on stdout (except `list`), so failures
+read as `{"ok": false, "error": ...}` rather than a traceback — the panel gets
+one contract to parse no matter what the hardware does.
+
+Speed matters here: asking solaar to build the settings list for a wireless
+mouse takes several seconds, because it probes every HID++ feature the device
+claims. That is fine once, and hopeless for a slider drag. So `logi daemon`
+keeps the devices open and answers over a unix socket in milliseconds, and
+every command below prefers the daemon, falling back to doing the work
+in-process when none is running. The fallback is slow but always correct,
+which keeps the CLI usable on its own.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import re
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+# solaar chats at the root logger while probing devices, and on Python 3.14 its
+# device destructors raise during interpreter shutdown. Silence the first here;
+# the second is handled by _exit() below.
+logging.disable(logging.CRITICAL)
+
+SOCKET_PATH = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "omarchy-logitech.sock")
+
+try:
+    from logitech_receiver.settings import Kind
+    from solaar.cli import _receivers_and_devices
+    from solaar.cli.config import select_choice
+    from solaar.cli.config import select_range
+    from solaar.cli.config import select_toggle
+except Exception as exc:  # pragma: no cover - only when solaar is absent
+    print(json.dumps({"ok": False, "error": f"solaar is not available: {exc}"}))
+    sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
+# Which settings reach the panel, and how they should be drawn.
+#
+# solaar exposes dozens of settings per device, most of them either read-only
+# curiosities or footguns (per-key lighting maps, button reprogramming). The
+# panel shows this curated set; `logi status --all` includes the rest for
+# anyone poking around from a terminal.
+# ---------------------------------------------------------------------------
+
+CONTROL_SPECS = {
+    # Mouse
+    "dpi": {"order": 10, "label": "Sensitivity", "unit": " DPI", "icon": "󰍽"},
+    "smart-shift": {"order": 20, "label": "Ratchet speed", "icon": "󰆾"},
+    "scroll-ratchet": {"order": 30, "label": "Scroll wheel", "icon": "󰬴"},
+    "hires-smooth-invert": {"order": 40, "label": "Invert scroll", "icon": "󰹹"},
+    "hires-smooth-resolution": {"order": 50, "label": "Smooth scroll", "icon": "󰡖"},
+    "thumb-scroll-invert": {"order": 60, "label": "Invert thumb wheel", "icon": "󰹹"},
+    "change-host": {"order": 90, "label": "Connected to", "icon": "󰍹", "disruptive": True},
+    # Keyboard
+    "brightness_control": {"order": 10, "label": "Brightness", "unit": "%", "icon": "󰃞"},
+    "rgb_control": {"order": 20, "label": "Software lighting", "icon": "󰌌"},
+    "rgb_idle_timeout": {"order": 60, "label": "Dim after", "icon": "󱎫"},
+    "rgb_sleep_timeout": {"order": 70, "label": "Lights off after", "icon": "󰤄"},
+    # Headset
+    "sidetone": {"order": 10, "label": "Sidetone", "unit": "%", "icon": "󰋎"},
+    "equalizer": {"order": 20, "label": "Equalizer", "icon": "󰺢"},
+}
+
+# Effects worth offering per zone, keyed by HID++ effect ID. The device reports
+# which of these it actually supports; anything it does not claim is dropped
+# before the panel ever sees it.
+RGB_EFFECTS = {
+    0x00: {"slug": "off", "name": "Off", "params": []},
+    0x01: {"slug": "static", "name": "Static", "params": ["color"]},
+    0x0A: {"slug": "breathe", "name": "Breathe", "params": ["color", "period"]},
+    0x15: {"slug": "cycle", "name": "Cycle", "params": ["period"]},
+    0x16: {"slug": "wave", "name": "Wave", "params": ["period"]},
+    0x17: {"slug": "ripple", "name": "Ripple", "params": ["color", "period"]},
+}
+
+EQ_PRESETS = {
+    "flat": [0, 0, 0, 0, 0],
+    "bass": [6, 3, 0, 0, 2],
+    "vocal": [-3, 0, 4, 3, 0],
+    "treble": [-2, -1, 0, 4, 6],
+    "game": [4, 0, -2, 2, 5],
+}
+
+BATTERY_STATUS_LABELS = {
+    "FULL": "full",
+    "DISCHARGING": "discharging",
+    "RECHARGING": "charging",
+    "SLOW_RECHARGE": "charging",
+    "ALMOST_FULL": "charging",
+    "CHARGING": "charging",
+}
+
+# Devices that report kind "?" get one inferred from the features they expose.
+KIND_BY_SETTING = {"sidetone": "headset", "equalizer": "headset", "dpi": "mouse"}
+
+
+def slugify(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", str(name).lower()).strip("-")
+
+
+def clamp(value, low, high):
+    return max(low, min(high, int(value)))
+
+
+class LogiError(Exception):
+    """Anything the caller should see as {"ok": false, "error": ...}."""
+
+
+def _exit(payload=None, human=None):
+    """Print and leave immediately.
+
+    os._exit skips solaar's device destructors, which raise ImportError storms
+    during Python 3.14's shutdown ("sys.meta_path is None"). Nothing here owns
+    state worth unwinding, so hard-exiting is both safe and quiet — but it also
+    skips flushing, hence the explicit flush.
+    """
+    if human is not None:
+        sys.stdout.write(human)
+    if payload is not None:
+        sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+    os._exit(0)
+
+
+# ---------------------------------------------------------------------------
+# Device discovery
+# ---------------------------------------------------------------------------
+
+
+class Index:
+    """The connected devices, with their (expensive to build) settings lists."""
+
+    def __init__(self):
+        self.entries = []
+        self.built_at = 0.0
+        self._lock = threading.Lock()
+
+    def rebuild(self):
+        with self._lock:
+            self.entries = discover()
+            self.built_at = time.time()
+        return self.entries
+
+    def all(self):
+        if not self.entries:
+            self.rebuild()
+        return self.entries
+
+    def find(self, key):
+        key = str(key).lower()
+        # Only rescan when the name is genuinely unknown — a rescan costs
+        # seconds, and this runs on every slider tick.
+        found = self._match(self.all(), key) or self._match(self.rebuild(), key)
+        if found is None:
+            known = ", ".join(e["key"] for e in self.entries) or "none"
+            raise LogiError(f"no Logitech device matching '{key}' (have: {known})")
+        return found
+
+    @staticmethod
+    def _match(entries, key):
+        for entry in entries:
+            if entry["key"] == key:
+                return entry
+        for entry in entries:
+            if key in entry["dev"].name.lower():
+                return entry
+        return None
+
+
+def discover():
+    """Every reachable device, whether plugged in directly or behind a receiver."""
+    found = []
+    for entry in _receivers_and_devices():
+        if hasattr(entry, "settings"):
+            found.append((entry, "USB"))
+            continue
+        # A receiver: its paired devices are what we actually care about.
+        try:
+            for child in entry:
+                if child is not None:
+                    found.append((child, getattr(entry, "name", "Receiver")))
+        except Exception:
+            continue
+
+    devices = []
+    for dev, via in found:
+        try:
+            settings = list(dev.settings)
+        except Exception:
+            settings = []
+        devices.append({"dev": dev, "via": via, "settings": settings})
+
+    # The G915 answers on two paths at once — USB while charging, and its
+    # Lightspeed receiver slot. Keep one entry per physical device: prefer the
+    # path that actually exposes settings, then the direct USB connection.
+    def rank(entry):
+        return (1 if entry["settings"] else 0, 1 if entry["via"] == "USB" else 0)
+
+    best = {}
+    for entry in devices:
+        slug = slugify(entry["dev"].name)
+        # Names differ slightly between paths ("G915 X" vs "G915 X LS"), so
+        # fold an entry into an existing one when either name prefixes the other.
+        match = next((k for k in best if k.startswith(slug) or slug.startswith(k)), None)
+        if match is None:
+            best[slug] = entry
+        elif rank(entry) > rank(best[match]):
+            best.pop(match)
+            best[slug] = entry
+
+    keep = list(best.values())
+
+    seen = {}
+    for entry in keep:
+        base = slugify(entry["dev"].name) or "device"
+        seen[base] = seen.get(base, 0) + 1
+        entry["key"] = base if seen[base] == 1 else f"{base}-{seen[base]}"
+    return keep
+
+
+def find_setting(entry, name):
+    for setting in entry["settings"]:
+        if setting.name == name:
+            return setting
+    raise LogiError(f"{entry['dev'].name} has no setting '{name}'")
+
+
+# ---------------------------------------------------------------------------
+# Reading state
+# ---------------------------------------------------------------------------
+
+
+def battery_of(dev):
+    try:
+        battery = dev.battery()
+    except Exception:
+        return None
+    if battery is None:
+        return None
+    level = getattr(battery, "level", None)
+    status = getattr(battery, "status", None)
+    status_name = getattr(status, "name", str(status) if status else "")
+    label = BATTERY_STATUS_LABELS.get(status_name, status_name.lower().replace("_", " "))
+    try:
+        level = int(level)
+    except (TypeError, ValueError):
+        # Older devices report an approximation ("full", "good", "low") instead
+        # of a percentage; map it onto something a progress ring can draw.
+        level = {"full": 90, "good": 60, "low": 20, "critical": 5}.get(str(level).lower())
+    if level is None and not label:
+        return None
+    return {
+        "level": level,
+        "status": label or "unknown",
+        "charging": label == "charging",
+        "low": level is not None and level <= 20 and label != "charging",
+    }
+
+
+def read_value(setting):
+    try:
+        return setting.read(False)
+    except Exception:
+        return None
+
+
+def describe_control(setting, include_all=False):
+    spec = CONTROL_SPECS.get(setting.name)
+    if spec is None and not include_all:
+        return None
+    spec = spec or {"order": 500, "label": setting.label}
+    kind = int(setting.kind or 0)
+    value = read_value(setting)
+
+    control = {
+        "name": setting.name,
+        "label": spec.get("label") or setting.label,
+        "icon": spec.get("icon", ""),
+        "order": spec.get("order", 500),
+        "unit": spec.get("unit", ""),
+        "disruptive": bool(spec.get("disruptive")),
+    }
+
+    if kind == int(Kind.TOGGLE):
+        control["ui"] = "toggle"
+        control["value"] = bool(value)
+    elif kind == int(Kind.CHOICE):
+        choices = [str(c) for c in (setting.choices or [])]
+        numeric = bool(choices) and all(str(c).isdigit() for c in choices)
+        control["choices"] = choices
+        control["value"] = str(value) if value is not None else ""
+        # A "choice" of 157 DPI steps is a slider wearing a disguise.
+        if numeric and len(choices) > 8:
+            numbers = sorted(int(c) for c in choices)
+            control["ui"] = "slider"
+            control["min"] = numbers[0]
+            control["max"] = numbers[-1]
+            control["step"] = numbers[1] - numbers[0] if len(numbers) > 1 else 1
+            control["value"] = int(value) if value is not None else numbers[0]
+        else:
+            control["ui"] = "choice"
+    elif kind == int(Kind.RANGE):
+        low, high = setting.range
+        control["ui"] = "slider"
+        control["min"] = int(low)
+        control["max"] = int(high)
+        control["step"] = max(1, (int(high) - int(low)) // 20)
+        control["value"] = int(value) if value is not None else int(low)
+    elif kind == int(Kind.PACKED_RANGE):
+        validator = setting._validator
+        bands = [str(k) for k in (getattr(validator, "keys", None) or [])]
+        control["ui"] = "equalizer"
+        control["bands"] = bands
+        control["min"] = int(getattr(validator, "min_value", -12))
+        control["max"] = int(getattr(validator, "max_value", 12))
+        control["value"] = [int(v) for v in value.values()] if value else [0] * len(bands)
+        control["presets"] = sorted(EQ_PRESETS)
+    else:
+        if not include_all:
+            return None
+        control["ui"] = "readonly"
+        control["value"] = str(value)
+    return control
+
+
+def describe_rgb(dev, settings=None):
+    """Zones, the effects each supports, and what each is playing right now."""
+    try:
+        infos = dev.led_effects
+    except Exception:
+        return None
+    if not infos or not getattr(infos, "zones", None):
+        return None
+    by_name = {s.name: s for s in (settings or [])}
+    zones = []
+    for zone in infos.zones:
+        effects = []
+        for effect in getattr(zone, "effects", []):
+            known = RGB_EFFECTS.get(int(effect.ID))
+            if known:
+                effects.append({"id": int(effect.ID), **known})
+        if not effects:
+            continue
+        # solaar names the settings rgb_zone_1..n, one past the zone index.
+        index = int(zone.index) + 1
+        zones.append(
+            {
+                "index": index,
+                "location": str(getattr(zone, "location", f"Zone {zone.index}")),
+                "effects": effects,
+                "current": current_effect(by_name.get(f"rgb_zone_{index}")),
+            }
+        )
+    return {"zones": zones} if zones else None
+
+
+def current_effect(setting):
+    """The effect a zone is playing, or None while the device owns its lighting."""
+    if setting is None:
+        return None
+    value = read_value(setting)
+    if value is None:
+        return None
+    effect_id = getattr(value, "ID", None)
+    if effect_id is None:
+        return None
+    known = RGB_EFFECTS.get(int(effect_id))
+    color = getattr(value, "color", None)
+    return {
+        "id": int(effect_id),
+        "slug": known["slug"] if known else str(effect_id),
+        "color": f"{int(color):06x}" if color is not None else None,
+    }
+
+
+def device_payload(entry, include_all=False):
+    dev = entry["dev"]
+    controls = []
+    for setting in entry["settings"]:
+        described = describe_control(setting, include_all)
+        if described:
+            controls.append(described)
+    controls.sort(key=lambda c: (c["order"], c["label"]))
+
+    kind = str(getattr(dev, "kind", "") or "")
+    if kind in ("", "?", "None"):
+        names = {c["name"] for c in controls}
+        kind = next((k for setting, k in KIND_BY_SETTING.items() if setting in names), "device")
+
+    payload = {
+        "key": entry["key"],
+        "name": dev.name,
+        "kind": kind,
+        "online": bool(getattr(dev, "online", True)),
+        "via": entry["via"],
+        "battery": battery_of(dev),
+        "controls": controls,
+        "controllable": bool(entry["settings"]),
+    }
+    rgb = describe_rgb(dev, entry["settings"])
+    if rgb:
+        payload["rgb"] = rgb
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Writing
+# ---------------------------------------------------------------------------
+
+
+def readback(setting):
+    value = read_value(setting)
+    if isinstance(value, dict):
+        return [int(v) for v in value.values()]
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def eq_value(setting, raw):
+    """Accept a preset name, a comma-separated list of dB values, or band=dB."""
+    validator = setting._validator
+    keys = [int(k) for k in (getattr(validator, "keys", None) or [])]
+    low = int(getattr(validator, "min_value", -12))
+    high = int(getattr(validator, "max_value", 12))
+    current = read_value(setting) or {k: 0 for k in keys}
+
+    text = str(raw).strip().lower()
+    if text in EQ_PRESETS:
+        levels = EQ_PRESETS[text]
+        return {k: clamp(levels[i] if i < len(levels) else 0, low, high) for i, k in enumerate(keys)}
+    if "=" in text:
+        band, _, level = text.partition("=")
+        result = dict(current)
+        result[int(band)] = clamp(int(level), low, high)
+        return result
+    levels = [int(part) for part in re.split(r"[,\s]+", text) if part]
+    return {k: clamp(levels[i] if i < len(levels) else 0, low, high) for i, k in enumerate(keys)}
+
+
+def write_setting(entry, name, raw):
+    setting = find_setting(entry, name)
+    kind = int(setting.kind or 0)
+    try:
+        if kind == int(Kind.TOGGLE):
+            value = select_toggle(str(raw), setting)
+        elif kind == int(Kind.CHOICE):
+            value = select_choice(str(raw), setting.choices, setting, None)
+        elif kind == int(Kind.RANGE):
+            value = select_range(str(raw), setting)
+        elif kind == int(Kind.PACKED_RANGE):
+            value = eq_value(setting, raw)
+        else:
+            raise LogiError(f"'{name}' is not a setting this plugin knows how to write")
+        setting.write(value)
+    except LogiError:
+        raise
+    except Exception as exc:
+        raise LogiError(f"could not set {name}: {exc}")
+
+    return {"ok": True, "device": entry["key"], "setting": name, "value": readback(setting)}
+
+
+# ---------------------------------------------------------------------------
+# Lighting
+# ---------------------------------------------------------------------------
+
+
+def parse_color(text):
+    value = str(text or "").strip().lstrip("#")
+    if not re.fullmatch(r"[0-9a-fA-F]{6}", value):
+        raise LogiError(f"'{text}' is not a six-digit hex color")
+    return int(value, 16)
+
+
+def effect_by_slug(slug):
+    for effect_id, effect in RGB_EFFECTS.items():
+        if effect["slug"] == str(slug).lower() or str(effect_id) == str(slug):
+            return effect_id, effect
+    raise LogiError(f"unknown effect '{slug}' (have: {', '.join(e['slug'] for e in RGB_EFFECTS.values())})")
+
+
+def apply_rgb(entry, slug, color, period, zones):
+    from logitech_receiver.hidpp20 import LEDEffectSetting
+
+    effect_id, effect = effect_by_slug(slug)
+    rgb = describe_rgb(entry["dev"]) or {"zones": []}
+    targets = rgb["zones"]
+    if zones and str(zones) != "all":
+        wanted = {int(z) for z in str(zones).split(",")}
+        targets = [z for z in targets if z["index"] in wanted]
+    if not targets:
+        raise LogiError(f"{entry['dev'].name} has no controllable lighting zones")
+
+    # Zone effects are ignored unless the device has handed lighting control to
+    # the host, so claim it first — otherwise the write silently does nothing.
+    control = next((s for s in entry["settings"] if s.name == "rgb_control"), None)
+    if control is not None and not read_value(control):
+        try:
+            control.write(True)
+        except Exception as exc:
+            raise LogiError(f"could not take over lighting: {exc}")
+
+    applied = []
+    for zone in targets:
+        if effect_id not in {e["id"] for e in zone["effects"]}:
+            continue
+        params = {"ID": effect_id}
+        if "color" in effect["params"]:
+            params["color"] = color if color is not None else 0xFFFFFF
+        if "period" in effect["params"]:
+            params["period"] = int(period)
+        if effect_id == 0x01:
+            params["ramp"] = 0
+        if effect_id in (0x15, 0x16, 0x17):
+            params["saturation"] = 100
+        if effect_id in (0x0A, 0x15, 0x16):
+            params["intensity"] = 100
+        setting = find_setting(entry, f"rgb_zone_{zone['index']}")
+        try:
+            setting.write(LEDEffectSetting(**params))
+        except Exception as exc:
+            raise LogiError(f"could not set {zone['location']} lighting: {exc}")
+        applied.append(zone["location"])
+
+    if not applied:
+        raise LogiError(f"{entry['dev'].name} does not support the '{effect['slug']}' effect")
+    return {
+        "ok": True,
+        "device": entry["key"],
+        "effect": effect["slug"],
+        "color": f"{color:06x}" if color is not None else None,
+        "zones": applied,
+    }
+
+
+def theme_accent():
+    """The current Omarchy theme's accent color, as an int."""
+    try:
+        theme = subprocess.run(
+            ["omarchy", "theme", "current"], capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+        directory = subprocess.run(
+            ["omarchy", "theme", "dir", theme], capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+    except Exception:
+        return None
+    candidates = []
+    if directory:
+        candidates.append(os.path.join(directory, "colors.toml"))
+    if theme:
+        candidates.append(os.path.expanduser(f"~/.config/omarchy/themes/{slugify(theme)}/colors.toml"))
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    match = re.match(r"\s*accent\s*=\s*[\"']?#?([0-9a-fA-F]{6})", line)
+                    if match:
+                        return int(match.group(1), 16)
+        except OSError:
+            continue
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Request handling — one implementation, shared by the daemon and the CLI
+# ---------------------------------------------------------------------------
+
+
+def handle(index, request):
+    action = request.get("action")
+
+    if action == "ping":
+        return {"ok": True, "pid": os.getpid(), "devices": len(index.all())}
+
+    if action == "status":
+        entries = index.rebuild() if request.get("rescan") else index.all()
+        return {"ok": True, "devices": [device_payload(e, request.get("all", False)) for e in entries]}
+
+    if action == "set":
+        entry = index.find(request["device"])
+        return write_setting(entry, request["setting"], request["value"])
+
+    if action == "toggle":
+        entry = index.find(request["device"])
+        setting = find_setting(entry, request["setting"])
+        if int(setting.kind or 0) != int(Kind.TOGGLE):
+            raise LogiError(f"'{request['setting']}' is not a toggle")
+        return write_setting(entry, request["setting"], "false" if read_value(setting) else "true")
+
+    if action == "rgb":
+        entry = index.find(request["device"])
+        color = parse_color(request["color"]) if request.get("color") else None
+        return apply_rgb(entry, request["effect"], color, request.get("period", 5000), request.get("zone", "all"))
+
+    if action == "theme":
+        color = parse_color(request["color"]) if request.get("color") else theme_accent()
+        if color is None:
+            raise LogiError("could not read an accent color from the current Omarchy theme")
+        applied = []
+        for entry in index.all():
+            if describe_rgb(entry["dev"]):
+                applied.append(apply_rgb(entry, request.get("effect", "static"), color, request.get("period", 5000), "all"))
+        if not applied:
+            raise LogiError("no device with controllable lighting is connected")
+        return {"ok": True, "color": f"{color:06x}", "applied": applied}
+
+    raise LogiError(f"unknown action '{action}'")
+
+
+def dispatch(request, allow_daemon=True):
+    """Answer via the daemon when it is up, otherwise do the work here."""
+    if allow_daemon:
+        answer = ask_daemon(request)
+        if answer is not None:
+            return answer
+    try:
+        return handle(Index(), request)
+    except LogiError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def ask_daemon(request, timeout=20.0):
+    try:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(timeout)
+        client.connect(SOCKET_PATH)
+    except OSError:
+        return None
+    try:
+        client.sendall((json.dumps(request) + "\n").encode())
+        chunks = []
+        while True:
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if chunks[-1].endswith(b"\n"):
+                break
+        return json.loads(b"".join(chunks).decode() or "{}")
+    except (OSError, ValueError):
+        return None
+    finally:
+        client.close()
+
+
+# ---------------------------------------------------------------------------
+# Daemon
+# ---------------------------------------------------------------------------
+
+
+def notify(title, body, urgency="normal"):
+    try:
+        subprocess.Popen(
+            ["notify-send", "-a", "Logitech", "-u", urgency, "-i", "input-mouse", title, body],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+class Daemon:
+    """Keeps devices open so the panel gets millisecond answers.
+
+    Rebuilding the index costs seconds, so it happens on a hotplug (watched via
+    udev when pyudev is available, polled otherwise) rather than per request.
+    """
+
+    def __init__(self, poll=180, notify_low=True):
+        self.index = Index()
+        self.poll = poll
+        self.notify_low = notify_low
+        self.warned = set()
+        self.stale = threading.Event()
+        self.lock = threading.Lock()
+
+    def serve(self):
+        if ask_daemon({"action": "ping"}, timeout=2.0) is not None:
+            _exit({"ok": False, "error": "another logi daemon is already running"})
+        try:
+            os.unlink(SOCKET_PATH)
+        except FileNotFoundError:
+            pass
+
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(SOCKET_PATH)
+        os.chmod(SOCKET_PATH, 0o600)
+        server.listen(8)
+
+        self.index.rebuild()
+        threading.Thread(target=self.watch_hotplug, daemon=True).start()
+        threading.Thread(target=self.watch_battery, daemon=True).start()
+
+        while True:
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                continue
+            threading.Thread(target=self.serve_one, args=(conn,), daemon=True).start()
+
+    def serve_one(self, conn):
+        """Serve every request on this connection until the client hangs up.
+
+        One-shot CLI clients send a line and close; the shell plugin keeps its
+        socket open for the session and pipelines requests down it, which is
+        what makes dragging a slider cost a HID++ round trip instead of a
+        Python interpreter start.
+        """
+        buffer = b""
+        try:
+            conn.settimeout(None)
+            while True:
+                while b"\n" not in buffer:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        return
+                    buffer += chunk
+                line, _, buffer = buffer.partition(b"\n")
+                if not line.strip():
+                    continue
+                try:
+                    request = json.loads(line.decode())
+                except ValueError as exc:
+                    conn.sendall((json.dumps({"ok": False, "error": f"bad request: {exc}"}) + "\n").encode())
+                    continue
+                response = self.answer(request)
+                if "id" in request:
+                    response["id"] = request["id"]
+                conn.sendall((json.dumps(response) + "\n").encode())
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def answer(self, request):
+        # Device I/O is not reentrant — one request at a time.
+        with self.lock:
+            if self.stale.is_set():
+                self.stale.clear()
+                self.index.rebuild()
+            try:
+                return handle(self.index, request)
+            except LogiError as exc:
+                return {"ok": False, "error": str(exc)}
+            except Exception as exc:
+                return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def watch_hotplug(self):
+        """Mark the index stale when a HID device appears or disappears.
+
+        Only add/remove count. Writing a setting makes udev emit `change` on
+        the same hidraw node, so reacting to those would make every write
+        invalidate the index and pay for a multi-second rebuild on the request
+        right after it.
+        """
+        try:
+            import pyudev
+
+            context = pyudev.Context()
+            monitor = pyudev.Monitor.from_netlink(context)
+            monitor.filter_by(subsystem="hidraw")
+            for device in iter(monitor.poll, None):
+                if device.action in ("add", "remove"):
+                    self.stale.set()
+        except Exception:
+            # No pyudev, or the netlink socket went away: fall back to marking
+            # the index stale periodically so a hotplug is noticed eventually.
+            while True:
+                time.sleep(max(30, self.poll))
+                self.stale.set()
+
+    def watch_battery(self):
+        while True:
+            time.sleep(self.poll)
+            with self.lock:
+                for entry in list(self.index.entries):
+                    battery = battery_of(entry["dev"])
+                    if not battery or battery["level"] is None:
+                        continue
+                    key = entry["key"]
+                    if battery["low"] and key not in self.warned:
+                        self.warned.add(key)
+                        if self.notify_low:
+                            notify(
+                                f"{entry['dev'].name} battery low",
+                                f"{battery['level']}% remaining",
+                                urgency="critical",
+                            )
+                    elif not battery["low"] and key in self.warned:
+                        # Re-arm only once it is genuinely back up, so a device
+                        # hovering at the threshold does not nag.
+                        if battery["charging"] or (battery["level"] or 0) > 25:
+                            self.warned.discard(key)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def cmd_status(args):
+    _exit(dispatch({"action": "status", "all": args.all, "rescan": args.rescan}, not args.direct))
+
+
+def cmd_list(args):
+    answer = dispatch({"action": "status"}, not args.direct)
+    if not answer.get("ok"):
+        _exit(answer)
+    lines = []
+    for device in answer["devices"]:
+        battery = device.get("battery")
+        suffix = ""
+        if battery and battery.get("level") is not None:
+            suffix = f"  {battery['level']}% ({battery['status']})"
+        elif battery:
+            suffix = f"  {battery['status']}"
+        lines.append(f"{device['key']:<16} {device['name']} — {device['kind']} via {device['via']}{suffix}")
+        for control in device["controls"]:
+            value = control["value"]
+            if isinstance(value, list):
+                value = ", ".join(str(v) for v in value)
+            lines.append(f"    {control['name']:<24} {value}{control['unit']}")
+        for zone in (device.get("rgb") or {}).get("zones", []):
+            effects = ", ".join(e["slug"] for e in zone["effects"])
+            lines.append(f"    lighting zone {zone['index']} ({zone['location']}): {effects}")
+    _exit(human=("\n".join(lines) + "\n") if lines else "No Logitech devices found.\n")
+
+
+def cmd_set(args):
+    _exit(dispatch({"action": "set", "device": args.device, "setting": args.setting, "value": args.value}, not args.direct))
+
+
+def cmd_toggle(args):
+    _exit(dispatch({"action": "toggle", "device": args.device, "setting": args.setting}, not args.direct))
+
+
+def cmd_rgb(args):
+    _exit(
+        dispatch(
+            {
+                "action": "rgb",
+                "device": args.device,
+                "effect": args.effect,
+                "color": args.color,
+                "period": args.period,
+                "zone": args.zone,
+            },
+            not args.direct,
+        )
+    )
+
+
+def cmd_theme(args):
+    _exit(
+        dispatch(
+            {"action": "theme", "color": args.color, "effect": args.effect, "period": args.period},
+            not args.direct,
+        )
+    )
+
+
+def cmd_ping(args):
+    answer = ask_daemon({"action": "ping"}, timeout=3.0)
+    _exit(answer or {"ok": False, "error": "no logi daemon is running"})
+
+
+def cmd_daemon(args):
+    Daemon(poll=args.poll, notify_low=not args.no_notify).serve()
+
+
+PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+UNIT_NAME = "omarchy-logitech.service"
+UNIT_DEST = os.path.expanduser(f"~/.config/systemd/user/{UNIT_NAME}")
+HOOK_NAME = "logitech-lighting.hook"
+HOOK_DEST = os.path.expanduser(f"~/.config/omarchy/hooks/theme-set.d/{HOOK_NAME}")
+BIN_DEST = os.path.expanduser("~/.local/bin/logi")
+
+
+def systemctl(*args):
+    return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True).returncode == 0
+
+
+def cmd_service(args):
+    """Install or remove the daemon unit, the PATH symlink, and the theme hook."""
+    steps = []
+    if args.what == "install":
+        source = os.path.join(PLUGIN_DIR, UNIT_NAME)
+        if not os.path.isfile(source):
+            _exit({"ok": False, "error": f"missing {source}"})
+        os.makedirs(os.path.dirname(UNIT_DEST), exist_ok=True)
+        with open(source, "r", encoding="utf-8") as src, open(UNIT_DEST, "w", encoding="utf-8") as dst:
+            dst.write(src.read())
+        steps.append(UNIT_DEST)
+        systemctl("daemon-reload")
+        systemctl("enable", "--now", UNIT_NAME)
+        steps.append("service enabled")
+
+        if not args.no_path:
+            os.makedirs(os.path.dirname(BIN_DEST), exist_ok=True)
+            if os.path.islink(BIN_DEST) or os.path.exists(BIN_DEST):
+                os.unlink(BIN_DEST)
+            os.symlink(os.path.join(PLUGIN_DIR, "bin", "logi"), BIN_DEST)
+            steps.append(BIN_DEST)
+
+        # Opt-in: repainting the keyboard on every theme switch is a surprise
+        # unless it was asked for.
+        if args.theme_hook:
+            source = os.path.join(PLUGIN_DIR, "hooks", "theme-set.d", HOOK_NAME)
+            os.makedirs(os.path.dirname(HOOK_DEST), exist_ok=True)
+            with open(source, "r", encoding="utf-8") as src, open(HOOK_DEST, "w", encoding="utf-8") as dst:
+                dst.write(src.read())
+            os.chmod(HOOK_DEST, 0o755)
+            steps.append(HOOK_DEST)
+        _exit({"ok": True, "installed": steps})
+
+    # uninstall — only ever removes what this plugin put there.
+    systemctl("disable", "--now", UNIT_NAME)
+    for path in (UNIT_DEST, HOOK_DEST, BIN_DEST):
+        try:
+            if os.path.islink(path) or os.path.isfile(path):
+                os.unlink(path)
+                steps.append(path)
+        except OSError as exc:
+            steps.append(f"could not remove {path}: {exc}")
+    systemctl("daemon-reload")
+    _exit({"ok": True, "removed": steps})
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="logi", description="Control Logitech devices")
+    parser.add_argument(
+        "--direct",
+        action="store_true",
+        help="bypass the daemon and talk to the hardware in this process (slow)",
+    )
+    sub = parser.add_subparsers(dest="action", required=True)
+
+    p = sub.add_parser("status", help="JSON snapshot of every connected device")
+    p.add_argument("--all", action="store_true", help="include settings the panel hides")
+    p.add_argument("--rescan", action="store_true", help="re-probe the hardware instead of using the daemon's index")
+    p.set_defaults(func=cmd_status)
+
+    sub.add_parser("list", help="human-readable summary").set_defaults(func=cmd_list)
+
+    p = sub.add_parser("set", help="change one setting")
+    p.add_argument("device")
+    p.add_argument("setting")
+    p.add_argument("value")
+    p.set_defaults(func=cmd_set)
+
+    p = sub.add_parser("toggle", help="flip a boolean setting")
+    p.add_argument("device")
+    p.add_argument("setting")
+    p.set_defaults(func=cmd_toggle)
+
+    p = sub.add_parser("rgb", help="set a lighting effect")
+    p.add_argument("device")
+    p.add_argument("effect", help=", ".join(e["slug"] for e in RGB_EFFECTS.values()))
+    p.add_argument("--color", default=None, help="hex color, e.g. 2bb3e6")
+    p.add_argument("--period", type=int, default=5000, help="animation period in ms")
+    p.add_argument("--zone", default="all")
+    p.set_defaults(func=cmd_rgb)
+
+    p = sub.add_parser("theme", help="match lighting to the current Omarchy theme")
+    p.add_argument("--color", default=None, help="override the theme accent")
+    p.add_argument("--effect", default="static")
+    p.add_argument("--period", type=int, default=5000)
+    p.set_defaults(func=cmd_theme)
+
+    sub.add_parser("ping", help="check whether the daemon is up").set_defaults(func=cmd_ping)
+
+    p = sub.add_parser("daemon", help="hold the devices open and serve the panel")
+    p.add_argument("--poll", type=int, default=180, help="battery poll interval in seconds")
+    p.add_argument("--no-notify", action="store_true", help="do not warn about low batteries")
+    p.set_defaults(func=cmd_daemon)
+
+    p = sub.add_parser("service", help="install or remove the daemon user service")
+    p.add_argument("what", choices=["install", "uninstall"])
+    p.add_argument("--theme-hook", action="store_true", help="also repaint lighting on Omarchy theme changes")
+    p.add_argument("--no-path", action="store_true", help="skip the ~/.local/bin/logi symlink")
+    p.set_defaults(func=cmd_service)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        _exit()
+    except Exception as exc:  # last resort — the caller must always get JSON
+        _exit({"ok": False, "error": f"{type(exc).__name__}: {exc}"})

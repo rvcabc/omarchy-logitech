@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.rvcabc.logitech",
+  "name": "Logitech",
+  "version": "1.0.0",
+  "author": "Bryce Corbin",
+  "license": "MIT",
+  "description": "Battery, DPI, lighting, and sidetone for connected Logitech devices.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Logitech",
+    "description": "Logitech devices: battery at a glance, click for DPI, brightness, lighting, and sidetone.",
+    "category": "Hardware",
+    "aliases": ["logitech", "logi", "mouse", "keyboard", "headset"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 90,
+      "showBatteryText": true,
+      "warnBelowPercent": 20
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "number",
+        "label": "Refresh interval (seconds)",
+        "min": 15,
+        "max": 900
+      },
+      {
+        "key": "showBatteryText",
+        "type": "boolean",
+        "label": "Show battery percentage in the bar"
+      },
+      {
+        "key": "warnBelowPercent",
+        "type": "number",
+        "label": "Warn below (%)",
+        "min": 5,
+        "max": 50
+      }
+    ]
+  }
+}

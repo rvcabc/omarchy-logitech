@@ -1,0 +1,9 @@
+#!/bin/bash
+# Repaint Logitech lighting whenever the Omarchy theme changes.
+#
+# Installed into ~/.config/omarchy/hooks/theme-set.d/ — delete that copy to
+# stop the keyboard from following the theme. `logi theme` reads the new
+# theme's accent color and writes it to every zone it can control; it exits
+# quietly when no lit device is connected.
+
+exec "$HOME/.config/omarchy/plugins/io.github.rvcabc.logitech/bin/logi" theme >/dev/null 2>&1 || true
