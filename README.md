@@ -30,11 +30,32 @@ omarchy plugin add https://github.com/rvcabc/omarchy-logitech --enable
 ~/.config/omarchy/plugins/io.github.rvcabc.logitech/bin/logi service install
 ```
 
+The plugin needs this one manual step: enabling it in the bar is not enough,
+because the panel talks to a background daemon.
+
 `logi service install` writes a systemd **user** unit, enables the daemon, and
-symlinks `logi` into `~/.local/bin`. Nothing is installed system-wide, and no
-existing configuration is modified. Add `--theme-hook` if you also want the
-keyboard repainted whenever you switch Omarchy themes, or `--no-path` to skip
-the symlink.
+symlinks `logi` into `~/.local/bin`. Nothing is installed system-wide and
+nothing runs as root. Add `--theme-hook` if you also want the keyboard
+repainted whenever you switch Omarchy themes, or `--no-path` to skip the
+symlink.
+
+**It will not overwrite anything it did not create.** Every file it writes
+carries a `managed-by: io.github.rvcabc.logitech` marker, and the symlink counts
+as its own only while it points into this plugin. Anything else at those paths —
+your own `~/.local/bin/logi`, a unit you wrote yourself, a file owned by another
+user — makes the install *refuse and stop*, naming the path:
+
+```
+$ logi service install
+{"ok": false, "error": "/home/you/.local/bin/logi already exists and was not
+ created by this plugin. Move it aside yourself, or re-run with --backup to
+ have it renamed to logi.bak.<timestamp>."}
+```
+
+Re-run with `--backup` to have the conflict renamed to `<name>.bak.<timestamp>`
+next to itself rather than destroyed. Managed files are replaced atomically
+(written to a temporary file in the same directory, then renamed over the
+target), so an interrupted install cannot leave a half-written unit behind.
 
 ## Remove
 
@@ -43,10 +64,15 @@ logi service uninstall
 omarchy plugin remove io.github.rvcabc.logitech
 ```
 
-`logi service uninstall` disables and deletes the user unit, the `~/.local/bin`
-symlink, and the theme hook — nothing else. Removing the plugin leaves your
-devices on whatever settings they currently hold; `logi rgb <device> off`
-hands lighting back to the keyboard's onboard effect first, if you want that.
+`logi service uninstall` disables the user unit and removes the unit file, the
+`~/.local/bin` symlink, and the theme hook — but only where those still carry
+the plugin's marker or still point into the plugin. Anything you replaced by
+hand in the meantime is reported as `left-alone` and kept. Backups made by
+`--backup` are never touched; delete them yourself when you no longer want them.
+
+Removing the plugin leaves your devices on whatever settings they currently
+hold; `logi rgb <device> off` hands lighting back to the keyboard's onboard
+effect first, if you want that.
 
 ## In the bar
 

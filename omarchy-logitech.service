@@ -1,4 +1,5 @@
 [Unit]
+# managed-by: io.github.rvcabc.logitech — installed by `logi service install`
 Description=Logitech device control daemon for the Omarchy shell
 Documentation=file:%h/.config/omarchy/plugins/io.github.rvcabc.logitech/README.md
 

@@ -34,6 +34,7 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -911,54 +912,181 @@ HOOK_DEST = os.path.expanduser(f"~/.config/omarchy/hooks/theme-set.d/{HOOK_NAME}
 BIN_DEST = os.path.expanduser("~/.local/bin/logi")
 
 
+LINK_SOURCE = os.path.join(PLUGIN_DIR, "bin", "logi")
+
+# Every file this installer writes carries this marker, and it only ever
+# replaces or removes files that carry it (or, for the symlink, that already
+# point into this plugin). `logi` is a generic name in a shared directory —
+# without a provenance check, installing here could clobber somebody else's
+# script and uninstalling could delete it.
+MANAGED_MARKER = "managed-by: io.github.rvcabc.logitech"
+
+
 def systemctl(*args):
     return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True).returncode == 0
 
 
+def carries_marker(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return MANAGED_MARKER in handle.read(8192)
+    except OSError:
+        return False
+
+
+def classify(path, kind):
+    """One of absent / managed / foreign, refusing anything that is not ours to touch.
+
+    `kind` is "file" for the unit and hook, "link" for the PATH symlink.
+    """
+    if not os.path.lexists(path):
+        return "absent"
+    info = os.lstat(path)
+    if info.st_uid != os.getuid():
+        raise LogiError(f"{path} belongs to another user; refusing to touch it")
+    if kind == "link":
+        if not os.path.islink(path):
+            return "foreign"
+        try:
+            return "managed" if os.path.realpath(path) == os.path.realpath(LINK_SOURCE) else "foreign"
+        except OSError:
+            return "foreign"
+    if os.path.islink(path):
+        # A symlink where a regular file belongs would make the write below
+        # follow it somewhere unexpected.
+        return "foreign"
+    if not os.path.isfile(path):
+        raise LogiError(f"{path} is not a regular file; refusing to touch it")
+    return "managed" if carries_marker(path) else "foreign"
+
+
+def move_aside(path):
+    """Rename a conflicting path next to itself, so nothing is ever destroyed."""
+    stamp = time.strftime("%Y%m%d%H%M%S", time.localtime())
+    backup = f"{path}.bak.{stamp}"
+    counter = 1
+    while os.path.lexists(backup):
+        backup = f"{path}.bak.{stamp}.{counter}"
+        counter += 1
+    os.rename(path, backup)
+    return backup
+
+
+def write_atomically(path, text, mode=0o644):
+    """Write via a temp file in the same directory, then rename over the target."""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(dir=directory, prefix=".logi-", suffix=".tmp")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def link_atomically(path, target):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    temporary = os.path.join(directory, f".logi-link-{os.getpid()}")
+    try:
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
+        os.symlink(target, temporary)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def read_source(*parts):
+    source = os.path.join(PLUGIN_DIR, *parts)
+    try:
+        with open(source, "r", encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError as exc:
+        raise LogiError(f"could not read {source}: {exc}")
+    if MANAGED_MARKER not in text:
+        raise LogiError(f"{source} is missing its provenance marker; refusing to install it")
+    return text
+
+
+def place(path, kind, backup, actions, text=None, mode=0o644):
+    """Install one managed path, refusing to overwrite anything that is not ours."""
+    state = classify(path, kind)
+    if state == "foreign":
+        if not backup:
+            raise LogiError(
+                f"{path} already exists and was not created by this plugin. "
+                f"Move it aside yourself, or re-run with --backup to have it renamed to "
+                f"{os.path.basename(path)}.bak.<timestamp>."
+            )
+        actions.append({"path": path, "action": "backed-up", "backup": move_aside(path)})
+    if kind == "link":
+        link_atomically(path, LINK_SOURCE)
+    else:
+        write_atomically(path, text, mode)
+    actions.append({"path": path, "action": "updated" if state == "managed" else "installed"})
+
+
+def remove(path, kind, actions):
+    """Remove one managed path, leaving anything unrecognized alone."""
+    state = classify(path, kind)
+    if state == "absent":
+        return
+    if state == "foreign":
+        actions.append({"path": path, "action": "left-alone", "reason": "not created by this plugin"})
+        return
+    try:
+        os.unlink(path)
+        actions.append({"path": path, "action": "removed"})
+    except OSError as exc:
+        actions.append({"path": path, "action": "failed", "reason": str(exc)})
+
+
 def cmd_service(args):
     """Install or remove the daemon unit, the PATH symlink, and the theme hook."""
-    steps = []
-    if args.what == "install":
-        source = os.path.join(PLUGIN_DIR, UNIT_NAME)
-        if not os.path.isfile(source):
-            _exit({"ok": False, "error": f"missing {source}"})
-        os.makedirs(os.path.dirname(UNIT_DEST), exist_ok=True)
-        with open(source, "r", encoding="utf-8") as src, open(UNIT_DEST, "w", encoding="utf-8") as dst:
-            dst.write(src.read())
-        steps.append(UNIT_DEST)
+    actions = []
+    try:
+        if args.what == "install":
+            place(UNIT_DEST, "file", args.backup, actions, text=read_source(UNIT_NAME))
+            systemctl("daemon-reload")
+            enabled = systemctl("enable", "--now", UNIT_NAME)
+            actions.append({"path": UNIT_NAME, "action": "enabled" if enabled else "enable-failed"})
+
+            if not args.no_path:
+                place(BIN_DEST, "link", args.backup, actions)
+
+            # Opt-in: repainting the keyboard on every theme switch is a
+            # surprise unless it was asked for.
+            if args.theme_hook:
+                place(
+                    HOOK_DEST,
+                    "file",
+                    args.backup,
+                    actions,
+                    text=read_source("hooks", "theme-set.d", HOOK_NAME),
+                    mode=0o755,
+                )
+            _exit({"ok": True, "actions": actions})
+
+        systemctl("disable", "--now", UNIT_NAME)
+        for path, kind in ((UNIT_DEST, "file"), (HOOK_DEST, "file"), (BIN_DEST, "link")):
+            remove(path, kind, actions)
         systemctl("daemon-reload")
-        systemctl("enable", "--now", UNIT_NAME)
-        steps.append("service enabled")
-
-        if not args.no_path:
-            os.makedirs(os.path.dirname(BIN_DEST), exist_ok=True)
-            if os.path.islink(BIN_DEST) or os.path.exists(BIN_DEST):
-                os.unlink(BIN_DEST)
-            os.symlink(os.path.join(PLUGIN_DIR, "bin", "logi"), BIN_DEST)
-            steps.append(BIN_DEST)
-
-        # Opt-in: repainting the keyboard on every theme switch is a surprise
-        # unless it was asked for.
-        if args.theme_hook:
-            source = os.path.join(PLUGIN_DIR, "hooks", "theme-set.d", HOOK_NAME)
-            os.makedirs(os.path.dirname(HOOK_DEST), exist_ok=True)
-            with open(source, "r", encoding="utf-8") as src, open(HOOK_DEST, "w", encoding="utf-8") as dst:
-                dst.write(src.read())
-            os.chmod(HOOK_DEST, 0o755)
-            steps.append(HOOK_DEST)
-        _exit({"ok": True, "installed": steps})
-
-    # uninstall — only ever removes what this plugin put there.
-    systemctl("disable", "--now", UNIT_NAME)
-    for path in (UNIT_DEST, HOOK_DEST, BIN_DEST):
-        try:
-            if os.path.islink(path) or os.path.isfile(path):
-                os.unlink(path)
-                steps.append(path)
-        except OSError as exc:
-            steps.append(f"could not remove {path}: {exc}")
-    systemctl("daemon-reload")
-    _exit({"ok": True, "removed": steps})
+        _exit({"ok": True, "actions": actions})
+    except LogiError as exc:
+        _exit({"ok": False, "error": str(exc), "actions": actions})
 
 
 def main():
@@ -1013,6 +1141,11 @@ def main():
     p.add_argument("what", choices=["install", "uninstall"])
     p.add_argument("--theme-hook", action="store_true", help="also repaint lighting on Omarchy theme changes")
     p.add_argument("--no-path", action="store_true", help="skip the ~/.local/bin/logi symlink")
+    p.add_argument(
+        "--backup",
+        action="store_true",
+        help="rename a conflicting file to <name>.bak.<timestamp> instead of refusing",
+    )
     p.set_defaults(func=cmd_service)
 
     args = parser.parse_args()
