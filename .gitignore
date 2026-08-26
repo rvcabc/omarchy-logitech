@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+
+# Prepared marketplace issue body — local only
+.marketplace-submission.md
