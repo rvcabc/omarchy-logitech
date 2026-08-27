@@ -1,5 +1,9 @@
 # Logitech for Omarchy
 
+*I only have three logi devices. If you send a pr for your device, i'll be happy to merge after verification*
+
+---
+
 Control your Logitech hardware from the Omarchy bar: battery at a glance, and
 the settings actually worth reaching for — mouse DPI and scroll behavior,
 keyboard brightness and RGB, headset sidetone and equalizer.
