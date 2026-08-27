@@ -196,7 +196,7 @@ Panel {
     function status(): string { return JSON.stringify(logitech.devices) }
   }
 
-  BarIconButton {
+  WidgetButton {
     id: button
     anchors.fill: parent
     bar: root.bar
