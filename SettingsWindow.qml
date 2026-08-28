@@ -211,12 +211,14 @@ PanelWindow {
                 spacing: Style.space(6)
                 Text {
                   text: Model.deviceGlyph(parent.parent.modelData)
+                  textFormat: Text.PlainText
                   color: parent.parent.active ? root.foreground : root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
                 }
                 Text {
                   text: parent.parent.modelData.name
+                  textFormat: Text.PlainText
                   color: parent.parent.active ? root.foreground : root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
@@ -295,6 +297,7 @@ PanelWindow {
                 spacing: Style.space(8)
                 Text {
                   text: modelData.label
+                  textFormat: Text.PlainText
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
@@ -303,6 +306,7 @@ PanelWindow {
                 Text {
                   Layout.maximumWidth: body.width * 0.55
                   text: String(modelData.value)
+                  textFormat: Text.PlainText
                   color: root.faint
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
@@ -335,6 +339,7 @@ PanelWindow {
     spacing: Style.space(4)
     Text {
       text: parent.title
+      textFormat: Text.PlainText
       color: root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
@@ -360,6 +365,7 @@ PanelWindow {
       Text {
         width: parent.width
         text: row.control ? row.control.label : ""
+        textFormat: Text.PlainText
         color: root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
@@ -369,6 +375,7 @@ PanelWindow {
         visible: !!(row.control && row.control.help)
         width: parent.width
         text: row.control ? row.control.help : ""
+        textFormat: Text.PlainText
         color: root.faint
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
@@ -437,6 +444,7 @@ PanelWindow {
         width: Style.space(64)
         horizontalAlignment: Text.AlignRight
         text: row.control ? Math.round(track.shown) + String(row.control.unit || "") : ""
+        textFormat: Text.PlainText
         color: root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
@@ -564,6 +572,7 @@ PanelWindow {
         Text {
           anchors.verticalCenter: parent.verticalCenter
           text: bandRow.modelData
+          textFormat: Text.PlainText
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall
@@ -616,6 +625,7 @@ PanelWindow {
       width: Style.space(110)
       horizontalAlignment: Text.AlignHCenter
       text: cycler.text
+      textFormat: Text.PlainText
       color: root.foreground
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall
@@ -659,6 +669,7 @@ PanelWindow {
         Text {
           anchors.verticalCenter: parent.verticalCenter
           text: modelData.label
+          textFormat: Text.PlainText
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.body

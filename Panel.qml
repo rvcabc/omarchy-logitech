@@ -288,6 +288,7 @@ Panel {
           Text {
             anchors.verticalCenter: parent.verticalCenter
             text: modelData ? Model.deviceGlyph(modelData) : "󰍽"
+            textFormat: Text.PlainText
             color: cell.tint
             font.family: button.fontFamily
             font.pixelSize: button.fontSize
@@ -311,6 +312,7 @@ Panel {
             visible: root.batteryStyle === "percent" && !!cell.battery
             anchors.verticalCenter: parent.verticalCenter
             text: Model.batteryText(cell.battery)
+            textFormat: Text.PlainText
             color: cell.tint
             font.family: button.fontFamily
             font.pixelSize: button.fontSize
@@ -321,6 +323,7 @@ Panel {
             visible: root.batteryStyle === "icon" && !!cell.battery
             anchors.verticalCenter: parent.verticalCenter
             text: Model.batteryGlyph(cell.battery)
+            textFormat: Text.PlainText
             color: cell.tint
             font.family: button.fontFamily
             font.pixelSize: button.fontSize
@@ -470,6 +473,7 @@ Panel {
             iconComponent: Component {
               Text {
                 text: root.barGlyph
+                textFormat: Text.PlainText
                 color: logitech.anyLow ? root.urgent : root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.display
@@ -501,6 +505,7 @@ Panel {
             visible: logitech.actionStatus !== "" || logitech.lastError !== ""
             width: parent.width
             text: logitech.actionStatus !== "" ? logitech.actionStatus : logitech.lastError
+            textFormat: Text.PlainText
             color: logitech.lastError !== "" && logitech.actionStatus === "" ? root.urgent : root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
@@ -548,6 +553,7 @@ Panel {
 
       Text {
         text: Model.deviceGlyph(section.device)
+        textFormat: Text.PlainText
         color: root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.icon
@@ -561,6 +567,7 @@ Panel {
         Text {
           Layout.fillWidth: true
           text: section.device ? section.device.name : ""
+          textFormat: Text.PlainText
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
@@ -570,6 +577,7 @@ Panel {
         Text {
           Layout.fillWidth: true
           text: section.device ? (section.device.via === "USB" ? "USB" : section.device.via) : ""
+          textFormat: Text.PlainText
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -580,6 +588,7 @@ Panel {
       Text {
         visible: !!section.battery
         text: Model.batteryGlyph(section.battery)
+        textFormat: Text.PlainText
         color: section.battery && section.battery.low ? root.urgent : root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.icon
@@ -589,6 +598,7 @@ Panel {
       Text {
         visible: !!section.battery
         text: Model.batteryText(section.battery)
+        textFormat: Text.PlainText
         color: section.battery && section.battery.low ? root.urgent : root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
@@ -667,6 +677,7 @@ Panel {
         Text {
           visible: !!(row.control && row.control.icon)
           text: row.control ? row.control.icon : ""
+          textFormat: Text.PlainText
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall
@@ -675,6 +686,7 @@ Panel {
         Text {
           Layout.fillWidth: true
           text: row.control ? row.control.label : ""
+          textFormat: Text.PlainText
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall
@@ -685,6 +697,7 @@ Panel {
         Text {
           visible: !!row.control && row.control.ui !== "toggle" && row.control.ui !== "equalizer"
           text: Model.controlValueText(row.control)
+          textFormat: Text.PlainText
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -795,6 +808,7 @@ Panel {
 
         Text {
           text: row.control && row.control.bands ? row.control.bands.join(" · ") : ""
+          textFormat: Text.PlainText
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -958,6 +972,7 @@ Panel {
       id: chipLabel
       anchors.centerIn: parent
       text: chip.text
+      textFormat: Text.PlainText
       color: chip.warn && !chip.selected ? root.urgent : root.foreground
       opacity: chip.selected ? 1.0 : 0.85
       font.family: root.fontFamily

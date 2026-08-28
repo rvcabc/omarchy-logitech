@@ -29,9 +29,17 @@ function batteryGlyph(battery) {
   return battery.charging ? BATTERY_CHARGING[index] : BATTERY_EMPTY[index]
 }
 
+// Daemon and device strings can end up in shared shell components (the bar
+// tooltip, PanelHero's meta) whose Text sinks default to AutoText and are not
+// ours to change — swap angle brackets for lookalikes so nothing tag-shaped
+// survives. The plugin's own Text sinks force Text.PlainText as well.
+function plain(text) {
+  return String(text).replace(/</g, "‹").replace(/>/g, "›")
+}
+
 function batteryText(battery) {
   if (!battery) return ""
-  if (battery.level === null || battery.level === undefined) return String(battery.status || "")
+  if (battery.level === null || battery.level === undefined) return plain(battery.status || "")
   return Math.round(Number(battery.level)) + "%"
 }
 
@@ -40,7 +48,7 @@ function batteryDetail(battery) {
   var text = batteryText(battery)
   var status = String(battery.status || "")
   if (!status || status === "unknown") return text
-  return text + " · " + status
+  return text + " · " + plain(status)
 }
 
 // Devices that report a battery, weakest first — the bar shows the one most
@@ -66,12 +74,12 @@ function anyLow(devices, threshold) {
 }
 
 function barTooltip(devices, connected, error) {
-  if (error) return "Logitech — " + error
+  if (error) return "Logitech — " + plain(error)
   if (!connected) return "Logitech — connecting to the device daemon…"
   if (!devices || devices.length === 0) return "Logitech — no devices connected"
   var lines = devices.map(function (d) {
     var battery = d.battery ? "  " + batteryDetail(d.battery) : ""
-    return d.name + battery
+    return plain(d.name) + battery
   })
   lines.push("")
   lines.push("Click to open · right-click to match lighting to the theme")
