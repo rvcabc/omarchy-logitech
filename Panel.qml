@@ -208,6 +208,18 @@ Panel {
     pluginDir: root.pluginDir
   }
 
+  SettingsWindow {
+    id: settingsWindow
+    service: logitech
+    anchorItem: button
+    fontFamily: root.fontFamily
+  }
+
+  function openSettings() {
+    root.close()
+    settingsWindow.show("")
+  }
+
   IpcHandler {
     target: root.ipcTarget
     function open(): void { root.open() }
@@ -217,6 +229,11 @@ Panel {
     function toggle(): void { root.toggle() }
     function refresh(): string { logitech.refresh(true); return "ok" }
     function theme(): string { logitech.matchTheme(); return "ok" }
+    function settings(): string {
+      if (settingsWindow.open) settingsWindow.hide()
+      else root.openSettings()
+      return "ok"
+    }
     function status(): string { return JSON.stringify(logitech.devices) }
   }
 
@@ -418,6 +435,7 @@ Panel {
       onTextKey: function (t) {
         if (t === "r" || t === "R") logitech.refresh(true)
         else if (t === "t" || t === "T") logitech.matchTheme()
+        else if (t === "s" || t === "S") root.openSettings()
       }
 
       Flickable {
@@ -458,13 +476,23 @@ Panel {
               }
             }
             trailingControl: Component {
-              PanelActionButton {
-                iconText: "󰑐"
-                tooltipText: "Rescan devices"
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                enabled: !logitech.busy
-                onClicked: logitech.refresh(true)
+              Row {
+                spacing: Style.space(2)
+                PanelActionButton {
+                  iconText: "󰒓"
+                  tooltipText: "All settings (S)"
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  onClicked: root.openSettings()
+                }
+                PanelActionButton {
+                  iconText: "󰑐"
+                  tooltipText: "Rescan devices"
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  enabled: !logitech.busy
+                  onClicked: logitech.refresh(true)
+                }
               }
             }
           }

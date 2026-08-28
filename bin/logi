@@ -84,6 +84,23 @@ CONTROL_SPECS = {
     "equalizer": {"order": 20, "label": "Equalizer", "icon": "󰺢"},
 }
 
+# Settings outside the curated set that the full settings window still wants
+# nice labels and grouping for. Anything not listed falls back to solaar's own
+# label. `hidden` settings never leave the daemon: the lighting UI already
+# owns the rgb_* blobs, and the per-key color map is a 100-row footgun.
+
+ADVANCED_SPECS = {
+    "hires-scroll-mode": {"order": 110, "label": "High-resolution scroll", "icon": "\U000f0b74"},
+    "thumb-scroll-mode": {"order": 120, "label": "High-resolution thumb wheel", "icon": "\U000f0b74"},
+    "divert-keys": {"order": 200, "label": "Button behavior", "icon": "\U000f035c",
+                    "help": "Diverted buttons stop acting on this machine and go to software instead."},
+    "reprogrammable-keys": {"order": 210, "label": "Button assignments", "icon": "\U000f030c"},
+    "backlight": {"order": 130, "label": "Backlight", "icon": "\U000f00de"},
+    "pointer_speed": {"order": 100, "label": "Pointer speed", "icon": "\U000f037d"},
+}
+
+HIDDEN_SETTINGS = re.compile(r"^(per-key-lighting|rgb_zone_.*|rgb_idle_effect)$")
+
 # Effects worth offering per zone, keyed by HID++ effect ID. The device reports
 # which of these it actually supports; anything it does not claim is dropped
 # before the panel ever sees it.
@@ -289,12 +306,24 @@ def read_value(setting):
 
 
 def describe_control(setting, include_all=False):
-    spec = CONTROL_SPECS.get(setting.name)
-    if spec is None and not include_all:
+    if HIDDEN_SETTINGS.match(setting.name):
         return None
-    spec = spec or {"order": 500, "label": setting.label}
+    spec = CONTROL_SPECS.get(setting.name)
+    advanced = spec is None
+    if advanced and not include_all:
+        return None
+    spec = spec or dict(ADVANCED_SPECS.get(setting.name) or {"order": 500}, label=(ADVANCED_SPECS.get(setting.name) or {}).get("label") or setting.label)
     kind = int(setting.kind or 0)
-    value = read_value(setting)
+    # Per-key map state (diversion, remaps) is not readable back from the
+    # device; solaar tracks it in memory. A live read would overwrite that
+    # tracking with zeros, so map kinds stay on the cache.
+    if kind in (int(Kind.MAP_CHOICE), int(Kind.MULTIPLE_TOGGLE)):
+        try:
+            value = setting.read(True)
+        except Exception:
+            value = None
+    else:
+        value = read_value(setting)
 
     control = {
         "name": setting.name,
@@ -303,6 +332,8 @@ def describe_control(setting, include_all=False):
         "order": spec.get("order", 500),
         "unit": spec.get("unit", ""),
         "disruptive": bool(spec.get("disruptive")),
+        "advanced": advanced,
+        "help": spec.get("help", ""),
     }
 
     if kind == int(Kind.TOGGLE):
@@ -339,6 +370,29 @@ def describe_control(setting, include_all=False):
         control["max"] = int(getattr(validator, "max_value", 12))
         control["value"] = [int(v) for v in value.values()] if value else [0] * len(bands)
         control["presets"] = sorted(EQ_PRESETS)
+    elif kind == int(Kind.MAP_CHOICE) and hasattr(getattr(setting, "choices", None), "items"):
+        # A per-key map: each key carries its own value and its own menu of
+        # NamedInt options (button assignments, key diversion).
+        current = value if isinstance(value, dict) else {}
+        items = []  # cached value, per the read above
+        for key, options in setting.choices.items():
+            held = current.get(int(key))
+            items.append({
+                "id": int(key),
+                "label": str(key),
+                "value": int(held) if held is not None else None,
+                "choices": [{"id": int(o), "label": str(o)} for o in options],
+            })
+        control["ui"] = "keymap"
+        control["items"] = items
+    elif kind == int(Kind.MULTIPLE_TOGGLE) and isinstance(value, dict):
+        control["ui"] = "keymap"
+        control["items"] = [{
+            "id": int(k) if str(k).isdigit() else str(k),
+            "label": str(k),
+            "value": 1 if v else 0,
+            "choices": [{"id": 0, "label": "Off"}, {"id": 1, "label": "On"}],
+        } for k, v in value.items()]
     else:
         if not include_all:
             return None
@@ -467,10 +521,12 @@ def eq_value(setting, raw):
     return {k: clamp(levels[i] if i < len(levels) else 0, low, high) for i, k in enumerate(keys)}
 
 
-def write_setting(entry, name, raw):
+def write_setting(entry, name, raw, item=None):
     setting = find_setting(entry, name)
     kind = int(setting.kind or 0)
     try:
+        if item is not None and kind in (int(Kind.MAP_CHOICE), int(Kind.MULTIPLE_TOGGLE)):
+            return write_map_item(entry, setting, item, raw)
         if kind == int(Kind.TOGGLE):
             value = select_toggle(str(raw), setting)
         elif kind == int(Kind.CHOICE):
@@ -488,6 +544,40 @@ def write_setting(entry, name, raw):
         raise LogiError(f"could not set {name}: {exc}")
 
     return {"ok": True, "device": entry["key"], "setting": name, "value": readback(setting)}
+
+
+def write_map_item(entry, setting, item, raw):
+    """Write one key of a per-key map, validating against that key's options."""
+    key = int(item)
+    value = int(raw)
+    choices = getattr(setting, "choices", None)
+    if hasattr(choices, "items"):
+        options = None
+        for candidate, opts in choices.items():
+            if int(candidate) == key:
+                options = [int(o) for o in opts]
+                break
+        if options is None:
+            raise LogiError(f"'{setting.name}' has no key {key}")
+        if value not in options:
+            raise LogiError(f"{value} is not an option for key {key} of '{setting.name}'")
+    elif int(setting.kind or 0) == int(Kind.MULTIPLE_TOGGLE):
+        value = 1 if value else 0
+    try:
+        written = setting.write_key_value(key, value)
+    except Exception as exc:
+        raise LogiError(f"could not set {setting.name}[{key}]: {exc}")
+    if written is None:
+        raise LogiError(f"the device rejected {setting.name}[{key}] = {value}")
+    # Map state is not readable back from the device; the setting's own cache
+    # (updated by write_key_value) is the source of truth.
+    try:
+        current = setting.read(True)
+    except Exception:
+        current = None
+    items = {int(k): int(v) for k, v in current.items()} if isinstance(current, dict) else {key: value}
+    return {"ok": True, "device": entry["key"], "setting": setting.name, "item": key,
+            "value": items.get(key, value), "items": items}
 
 
 # ---------------------------------------------------------------------------
@@ -610,7 +700,7 @@ def handle(index, request):
 
     if action == "set":
         entry = index.find(request["device"])
-        return write_setting(entry, request["setting"], request["value"])
+        return write_setting(entry, request["setting"], request["value"], request.get("item"))
 
     if action == "toggle":
         entry = index.find(request["device"])

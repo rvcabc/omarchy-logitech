@@ -103,6 +103,95 @@ Item {
     })
   }
 
+  // The full settings window works from its own model carrying every setting
+  // (all: true), fetched on demand so the bar's 90s heartbeat stays lean.
+  property var detailedDevices: []
+  property bool detailLoading: false
+
+  function refreshDetailed() {
+    detailLoading = true
+    send({ action: "status", all: true }, function (message) {
+      detailLoading = false
+      if (message.devices) detailedDevices = message.devices
+    })
+  }
+
+  function detailedControlFor(key, name) {
+    for (var i = 0; i < detailedDevices.length; i++) {
+      if (detailedDevices[i].key !== key) continue
+      var controls = detailedDevices[i].controls
+      for (var j = 0; j < controls.length; j++) if (controls[j].name === name) return controls[j]
+    }
+    return null
+  }
+
+  // Rewrite one control in the detailed model, mirroring applyLocally.
+  function applyDetailLocally(key, name, patch) {
+    var copy = detailedDevices.slice()
+    for (var i = 0; i < copy.length; i++) {
+      if (copy[i].key !== key) continue
+      var device = JSON.parse(JSON.stringify(copy[i]))
+      for (var j = 0; j < device.controls.length; j++) {
+        if (device.controls[j].name === name) { patch(device.controls[j]); break }
+      }
+      copy[i] = device
+      break
+    }
+    detailedDevices = copy
+  }
+
+  // Write a whole-setting value from the settings window: the detailed model
+  // updates optimistically, the reply reconciles it, and the bar model
+  // refreshes so curated controls stay in step.
+  function setDetail(key, name, value) {
+    applyDetailLocally(key, name, function (control) { control.value = value })
+    pendingWrites++
+    send({ action: "set", device: key, setting: name, value: String(value) }, function (message) {
+      pendingWrites = Math.max(0, pendingWrites - 1)
+      if (message.ok && message.value !== undefined && message.value !== null) {
+        applyDetailLocally(key, name, function (control) { control.value = message.value })
+        applyLocally(key, name, message.value)
+      } else if (!message.ok) {
+        refreshDetailed()
+      }
+    })
+  }
+
+  function toggleDetail(key, name) {
+    var control = detailedControlFor(key, name)
+    if (control) setDetail(key, name, control.value ? "false" : "true")
+  }
+
+  function cycleDetailChoice(key, name, direction) {
+    var control = detailedControlFor(key, name)
+    var next = Model.nextChoice(control, direction)
+    if (next !== null) setDetail(key, name, next)
+  }
+
+  // Write one key of a per-key map (button assignments, diversion). The reply
+  // carries the whole map back, which lands in the detailed model.
+  function setMapItem(key, name, itemId, value) {
+    applyDetailLocally(key, name, function (control) {
+      for (var i = 0; i < (control.items || []).length; i++) {
+        if (control.items[i].id === itemId) { control.items[i].value = value; break }
+      }
+    })
+    pendingWrites++
+    send({ action: "set", device: key, setting: name, item: itemId, value: String(value) }, function (message) {
+      pendingWrites = Math.max(0, pendingWrites - 1)
+      if (message.ok && message.items) {
+        applyDetailLocally(key, name, function (control) {
+          for (var i = 0; i < (control.items || []).length; i++) {
+            var held = message.items[String(control.items[i].id)]
+            if (held !== undefined) control.items[i].value = held
+          }
+        })
+      } else if (!message.ok) {
+        refreshDetailed()
+      }
+    })
+  }
+
   function deviceFor(key) {
     for (var i = 0; i < devices.length; i++) if (devices[i].key === key) return devices[i]
     return null
