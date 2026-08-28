@@ -142,7 +142,8 @@ def _exit(payload=None, human=None):
     if payload is not None:
         sys.stdout.write(json.dumps(payload) + "\n")
     sys.stdout.flush()
-    os._exit(0)
+    # Failures must be visible to shell callers, not just in the JSON.
+    os._exit(0 if payload is None or payload.get("ok", True) else 1)
 
 
 # ---------------------------------------------------------------------------
