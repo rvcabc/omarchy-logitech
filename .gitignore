@@ -3,3 +3,4 @@ __pycache__/
 
 # Prepared marketplace issue body — local only
 .marketplace-submission.md
+.marketplace-verify-*.md
