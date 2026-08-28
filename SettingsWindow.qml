@@ -25,16 +25,16 @@ PanelWindow {
   readonly property var anchorWindow: anchorItem ? anchorItem.QsWindow.window : null
   // Resolved at show() time: the window belongs on the monitor the user is
   // looking at, not on whichever bar instance happens to own it (IPC lands on
-  // one instance only, and its screen may be across the room).
-  property var targetScreen: null
-  screen: targetScreen ? targetScreen : (anchorWindow ? anchorWindow.screen : null)
-
-  function screenForFocus() {
-    var monitor = Hyprland.focusedMonitor
-    if (monitor) {
+  // one instance only, and its screen may be across the room). Held by NAME
+  // and re-resolved in the binding — a held ShellScreen object goes stale
+  // after a while, nulls the binding, and the window silently migrates back
+  // to the owning instance's monitor.
+  property string targetScreenName: ""
+  screen: {
+    if (targetScreenName !== "") {
       var screens = Quickshell.screens
       for (var i = 0; i < screens.length; i++) {
-        if (screens[i].name === monitor.name) return screens[i]
+        if (screens[i].name === targetScreenName) return screens[i]
       }
     }
     return anchorWindow ? anchorWindow.screen : null
@@ -64,11 +64,16 @@ PanelWindow {
 
   function show(key) {
     if (key) selectedKey = key
-    targetScreen = screenForFocus()
+    targetScreenName = Hyprland.focusedMonitor ? Hyprland.focusedMonitor.name : ""
     if (service) service.refreshDetailed()
     open = true
   }
   function hide() { open = false }
+  // refreshDetailed() replaces the model and rebuilds every Repeater, which
+  // can leave the Flickable scrolled to wherever the rebuild landed — reset
+  // to the top whenever the window opens or the device tab changes.
+  onOpenChanged: if (open) Qt.callLater(function () { keys.forceActiveFocus(); flick.contentY = 0 })
+  onSelectedKeyChanged: if (flick) flick.contentY = 0
   function toggle(key) { open ? hide() : show(key) }
 
   function cycleDevice(direction) {
@@ -231,11 +236,15 @@ PanelWindow {
           boundsBehavior: Flickable.StopAtBounds
           flickableDirection: Flickable.VerticalFlick
           interactive: contentHeight > height
-          ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+          // interactive: false — a hidden AsNeeded scrollbar is transparent
+          // but still hit-testable, and it sits exactly over the row
+          // controls' right edge, silently eating their clicks.
+          ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded; interactive: false }
 
           Column {
             id: body
-            width: flick.width
+            // Keep the rows clear of the scrollbar overlay.
+            width: flick.width - Style.spaceReal(10)
             spacing: Style.space(6)
 
             SectionHeader { title: "Controls"; visible: root.groupOf(root.current, "controls").length > 0 }
