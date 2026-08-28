@@ -904,7 +904,7 @@ def cmd_daemon(args):
     Daemon(poll=args.poll, notify_low=not args.no_notify).serve()
 
 
-PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 UNIT_NAME = "omarchy-logitech.service"
 UNIT_DEST = os.path.expanduser(f"~/.config/systemd/user/{UNIT_NAME}")
 HOOK_NAME = "logitech-lighting.hook"
