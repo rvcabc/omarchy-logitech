@@ -302,6 +302,7 @@ Panel {
               && (root.batteryStyle === "bar" || root.batteryStyle === "battery")
             anchors.verticalCenter: parent.verticalCenter
             text: "󱐋"
+            textFormat: Text.PlainText
             color: cell.tint
             font.family: button.fontFamily
             font.pixelSize: Style.font.bodySmall
@@ -516,6 +517,7 @@ Panel {
             visible: logitech.connected && root.devices.length === 0
             width: parent.width
             text: "No Logitech devices found.\nPlug one in, or switch a wireless device on."
+            textFormat: Text.PlainText
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
@@ -863,6 +865,7 @@ Panel {
 
         Text {
           text: "󰌵"
+          textFormat: Text.PlainText
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall
@@ -871,6 +874,7 @@ Panel {
         Text {
           Layout.fillWidth: true
           text: "Lighting"
+          textFormat: Text.PlainText
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall

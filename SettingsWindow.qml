@@ -160,12 +160,14 @@ PanelWindow {
 
           Text {
             text: "󰒓"
+            textFormat: Text.PlainText
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.display
           }
           Text {
             text: "Logitech Settings"
+            textFormat: Text.PlainText
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.title
@@ -238,6 +240,7 @@ PanelWindow {
           Layout.fillWidth: true
           text: root.service && root.service.detailLoading
             ? "Reading device settings…" : "No Logitech devices found."
+          textFormat: Text.PlainText
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
@@ -321,6 +324,7 @@ PanelWindow {
           Layout.fillWidth: true
           visible: !!(root.service && (root.service.actionStatus !== "" || root.service.lastError !== ""))
           text: root.service ? (root.service.actionStatus !== "" ? root.service.actionStatus : root.service.lastError) : ""
+          textFormat: Text.PlainText
           color: root.service && root.service.lastError !== "" && root.service.actionStatus === "" ? root.urgent : root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall
@@ -541,6 +545,7 @@ PanelWindow {
       Text {
         anchors.verticalCenter: parent.verticalCenter
         text: "Preset"
+        textFormat: Text.PlainText
         color: root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
@@ -598,6 +603,7 @@ PanelWindow {
             width: Style.space(64)
             horizontalAlignment: Text.AlignRight
             text: (bandSlider.shown > 0 ? "+" : "") + Math.round(bandSlider.shown) + " dB"
+            textFormat: Text.PlainText
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
@@ -653,6 +659,7 @@ PanelWindow {
       visible: !!(keymap.control && keymap.control.help)
       width: parent.width
       text: keymap.control ? keymap.control.help : ""
+      textFormat: Text.PlainText
       color: root.faint
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
