@@ -83,6 +83,16 @@ PanelWindow {
     selectedKey = devices[(index + direction + devices.length) % devices.length].key
   }
 
+  // Values crossing a Repeater's modelData boundary arrive as QVariantList,
+  // not JS Array: length and indexing work, Array.isArray and join do not.
+  function toArray(list) {
+    var out = []
+    if (list && list.length !== undefined) {
+      for (var i = 0; i < list.length; i++) out.push(list[i])
+    }
+    return out
+  }
+
   // Rows are grouped by weight: the curated set first, then everything else
   // writable, with read-only values tucked at the bottom for reference.
   function groupOf(device, wanted) {
@@ -92,6 +102,7 @@ PanelWindow {
       var control = device.controls[i]
       var group = control.ui === "readonly" ? "info"
         : control.ui === "keymap" ? "keymap"
+        : control.ui === "equalizer" ? "equalizer"
         : control.advanced ? "tuning" : "controls"
       if (group === wanted) out.push(control)
     }
@@ -123,7 +134,13 @@ PanelWindow {
 
     Item {
       id: keys
+      // BorderSurface does not inset children itself; without these margins
+      // the text sits on the border.
       anchors.fill: parent
+      anchors.topMargin: card.contentTopInset
+      anchors.rightMargin: card.contentRightInset
+      anchors.bottomMargin: card.contentBottomInset
+      anchors.leftMargin: card.contentLeftInset
       focus: true
       Keys.onPressed: function (event) {
         if (event.key === Qt.Key_Escape) { root.hide(); event.accepted = true }
@@ -260,6 +277,11 @@ PanelWindow {
             }
 
             Repeater {
+              model: root.groupOf(root.current, "equalizer")
+              EqualizerSection { required property var modelData; width: body.width; control: modelData }
+            }
+
+            Repeater {
               model: root.groupOf(root.current, "keymap")
               KeymapSection { required property var modelData; width: body.width; control: modelData }
             }
@@ -383,28 +405,14 @@ PanelWindow {
       }
     }
 
-    // choice / equalizer preset cycler
+    // choice cycler
     ChoiceCycler {
-      visible: !!(row.control && (row.control.ui === "choice" || row.control.ui === "equalizer"))
+      visible: !!(row.control && row.control.ui === "choice")
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
-      text: {
-        if (!row.control) return ""
-        if (row.control.ui === "equalizer") return "Preset…"
-        return String(row.control.value)
-      }
+      text: row.control ? String(row.control.value) : ""
       onCycle: function (direction) {
-        if (row.control.ui === "equalizer") {
-          var presets = row.control.presets || []
-          if (presets.length === 0) return
-          // Cycle through presets from wherever the panel last left it.
-          var index = Math.max(0, presets.indexOf(root._eqCursor))
-          index = (index + direction + presets.length) % presets.length
-          root._eqCursor = presets[index]
-          root.service.setEqualizer(row.deviceKey, presets[index])
-        } else {
-          root.service.cycleDetailChoice(row.deviceKey, row.control.name, direction)
-        }
+        root.service.cycleDetailChoice(row.deviceKey, row.control.name, direction)
       }
     }
 
@@ -415,59 +423,18 @@ PanelWindow {
       anchors.verticalCenter: parent.verticalCenter
       spacing: Style.space(8)
 
-      Item {
+      HSlider {
         id: track
-        width: Style.space(150)
-        height: Style.space(20)
         anchors.verticalCenter: parent.verticalCenter
-        readonly property real min: row.control ? Number(row.control.min || 0) : 0
-        readonly property real max: row.control ? Number(row.control.max || 100) : 100
-        property real localValue: -1
-        readonly property real shown: localValue >= 0 ? localValue
-          : (row.control ? Number(row.control.value || 0) : 0)
-        readonly property real fraction: max > min ? Math.max(0, Math.min(1, (shown - min) / (max - min))) : 0
-
-        Rectangle {
-          anchors.verticalCenter: parent.verticalCenter
-          width: parent.width
-          height: Style.space(5)
-          radius: height / 2
-          color: root.dim
-          opacity: 0.35
-        }
-        Rectangle {
-          anchors.verticalCenter: parent.verticalCenter
-          width: Math.max(height, parent.width * parent.fraction)
-          height: Style.space(5)
-          radius: height / 2
-          color: root.accent
-        }
-        Rectangle {
-          x: Math.max(0, Math.min(parent.width - width, parent.width * parent.fraction - width / 2))
-          anchors.verticalCenter: parent.verticalCenter
-          width: Style.space(12)
-          height: width
-          radius: width / 2
-          color: root.foreground
-        }
-        MouseArea {
-          anchors.fill: parent
-          cursorShape: Qt.PointingHandCursor
-          function valueAt(x) {
-            var fraction = Math.max(0, Math.min(1, x / track.width))
-            return Model.snapToStep(row.control, track.min + fraction * (track.max - track.min))
-          }
-          onPressed: function (mouse) { track.localValue = valueAt(mouse.x) }
-          onPositionChanged: function (mouse) { if (pressed) track.localValue = valueAt(mouse.x) }
-          onReleased: function (mouse) {
-            root.service.setDetail(row.deviceKey, row.control.name, valueAt(mouse.x))
-            track.localValue = -1
-          }
-        }
+        min: row.control ? Number(row.control.min || 0) : 0
+        max: row.control ? Number(row.control.max || 100) : 100
+        value: row.control ? Number(row.control.value || 0) : 0
+        snap: function (raw) { return Model.snapToStep(row.control, raw) }
+        onCommitted: function (v) { root.service.setDetail(row.deviceKey, row.control.name, v) }
       }
       Text {
         anchors.verticalCenter: parent.verticalCenter
-        width: Style.space(52)
+        width: Style.space(64)
         horizontalAlignment: Text.AlignRight
         text: row.control ? Math.round(track.shown) + String(row.control.unit || "") : ""
         color: root.foreground
@@ -477,7 +444,159 @@ PanelWindow {
     }
   }
 
-  property string _eqCursor: "flat"
+  // Draggable horizontal slider: local value while dragging, committed(v) on
+  // release. `snap` maps a raw value onto the control's real steps.
+  component HSlider: Item {
+    id: slider
+    property real min: 0
+    property real max: 100
+    property real value: 0
+    property var snap: function (raw) { return Math.round(raw) }
+    signal committed(real v)
+
+    width: Style.space(150)
+    height: Style.space(20)
+    property real localValue: -3e38
+    readonly property real shown: localValue > -3e38 ? localValue : value
+    readonly property real fraction: max > min ? Math.max(0, Math.min(1, (shown - min) / (max - min))) : 0
+
+    Rectangle {
+      anchors.verticalCenter: parent.verticalCenter
+      width: parent.width
+      height: Style.space(5)
+      radius: height / 2
+      color: root.dim
+      opacity: 0.35
+    }
+    // For a bipolar range the fill grows from the zero point, so a flat EQ
+    // band reads as neutral rather than half full.
+    readonly property real zeroFraction: min < 0 && max > 0 ? (0 - min) / (max - min) : 0
+    Rectangle {
+      anchors.verticalCenter: parent.verticalCenter
+      x: parent.width * Math.min(slider.zeroFraction, slider.fraction)
+      width: Math.max(Style.space(3), parent.width * Math.abs(slider.fraction - slider.zeroFraction))
+      height: Style.space(5)
+      radius: height / 2
+      color: root.accent
+    }
+    Rectangle {
+      x: Math.max(0, Math.min(parent.width - width, parent.width * slider.fraction - width / 2))
+      anchors.verticalCenter: parent.verticalCenter
+      width: Style.space(12)
+      height: width
+      radius: width / 2
+      color: root.foreground
+    }
+    MouseArea {
+      anchors.fill: parent
+      cursorShape: Qt.PointingHandCursor
+      function valueAt(x) {
+        var fraction = Math.max(0, Math.min(1, x / slider.width))
+        return slider.snap(slider.min + fraction * (slider.max - slider.min))
+      }
+      onPressed: function (mouse) { slider.localValue = valueAt(mouse.x) }
+      onPositionChanged: function (mouse) { if (pressed) slider.localValue = valueAt(mouse.x) }
+      onReleased: function (mouse) {
+        slider.committed(valueAt(mouse.x))
+        slider.localValue = -3e38
+      }
+    }
+  }
+
+  // The equalizer gets a full section: preset cycler up top, then one slider
+  // per band so a custom curve is a drag away. A curve matching no preset
+  // shows as Custom.
+  component EqualizerSection: Column {
+    id: eq
+    property var control: null
+    readonly property string deviceKey: root.current ? root.current.key : ""
+    readonly property var curve: root.toArray(control ? control.value : null)
+    spacing: Style.space(4)
+
+    function presetName() {
+      var values = eq.control ? eq.control.presetValues : null
+      if (!values) return "—"
+      var flat = eq.curve.join(",")
+      var names = root.toArray(eq.control.presets)
+      for (var i = 0; i < names.length; i++) {
+        if (root.toArray(values[names[i]]).join(",") === flat) return names[i]
+      }
+      return "custom"
+    }
+
+    SectionHeader { title: eq.control ? eq.control.label : "Equalizer" }
+
+
+    Item {
+      width: parent.width
+      implicitHeight: Style.space(30)
+      Text {
+        anchors.verticalCenter: parent.verticalCenter
+        text: "Preset"
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+      }
+      ChoiceCycler {
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        text: eq.presetName()
+        onCycle: function (direction) {
+          var names = root.toArray(eq.control ? eq.control.presets : null)
+          if (names.length === 0) return
+          var index = names.indexOf(eq.presetName())
+          index = index < 0 ? (direction > 0 ? 0 : names.length - 1)
+            : (index + direction + names.length) % names.length
+          root.service.setEqualizer(eq.deviceKey, names[index])
+        }
+      }
+    }
+
+    Repeater {
+      model: eq.control ? (eq.control.bands || []) : []
+      Item {
+        id: bandRow
+        required property var modelData
+        required property int index
+        width: eq.width
+        implicitHeight: Style.space(26)
+
+        Text {
+          anchors.verticalCenter: parent.verticalCenter
+          text: bandRow.modelData
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+        }
+        Row {
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: Style.space(8)
+
+          HSlider {
+            id: bandSlider
+            anchors.verticalCenter: parent.verticalCenter
+            min: eq.control ? Number(eq.control.min) : -12
+            max: eq.control ? Number(eq.control.max) : 12
+            value: eq.curve.length > bandRow.index ? Number(eq.curve[bandRow.index]) : 0
+            onCommitted: function (v) {
+              // Band name ("114Hz") — the daemon matches it case-insensitively.
+              root.service.setEqualizerBand(eq.deviceKey, bandRow.index, bandRow.modelData, v)
+            }
+          }
+          Text {
+            anchors.verticalCenter: parent.verticalCenter
+            width: Style.space(64)
+            horizontalAlignment: Text.AlignRight
+            text: (bandSlider.shown > 0 ? "+" : "") + Math.round(bandSlider.shown) + " dB"
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+        }
+      }
+    }
+  }
 
   // ‹ value › — cycles through a closed set of options.
   component ChoiceCycler: Row {

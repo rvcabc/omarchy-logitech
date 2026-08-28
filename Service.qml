@@ -168,6 +168,24 @@ Item {
     if (next !== null) setDetail(key, name, next)
   }
 
+  // Write one equalizer band (daemon syntax "band=dB"); the reply carries the
+  // whole curve back.
+  function setEqualizerBand(key, bandIndex, band, db) {
+    applyDetailLocally(key, "equalizer", function (control) {
+      if (Array.isArray(control.value)) control.value[bandIndex] = db
+    })
+    pendingWrites++
+    send({ action: "set", device: key, setting: "equalizer", value: band + "=" + db }, function (message) {
+      pendingWrites = Math.max(0, pendingWrites - 1)
+      if (message.ok && message.value) {
+        applyDetailLocally(key, "equalizer", function (control) { control.value = message.value })
+        applyLocally(key, "equalizer", message.value)
+      } else if (!message.ok) {
+        refreshDetailed()
+      }
+    })
+  }
+
   // Write one key of a per-key map (button assignments, diversion). The reply
   // carries the whole map back, which lands in the detailed model.
   function setMapItem(key, name, itemId, value) {
@@ -264,7 +282,11 @@ Item {
     pendingWrites++
     send({ action: "set", device: key, setting: "equalizer", value: preset }, function (message) {
       pendingWrites = Math.max(0, pendingWrites - 1)
-      if (message.ok && message.value) applyLocally(key, "equalizer", message.value)
+      if (message.ok && message.value) {
+        applyLocally(key, "equalizer", message.value)
+        // The settings window renders from the detailed model; keep it live.
+        applyDetailLocally(key, "equalizer", function (control) { control.value = message.value })
+      }
       actionStatus = message.ok ? "Equalizer: " + preset : actionStatus
       statusResetTimer.restart()
     })

@@ -370,6 +370,9 @@ def describe_control(setting, include_all=False):
         control["max"] = int(getattr(validator, "max_value", 12))
         control["value"] = [int(v) for v in value.values()] if value else [0] * len(bands)
         control["presets"] = sorted(EQ_PRESETS)
+        # The curves themselves, so the settings window can tell "bass" from
+        # a hand-tuned curve and label the latter Custom.
+        control["presetValues"] = {name: list(levels) for name, levels in EQ_PRESETS.items()}
     elif kind == int(Kind.MAP_CHOICE) and hasattr(getattr(setting, "choices", None), "items"):
         # A per-key map: each key carries its own value and its own menu of
         # NamedInt options (button assignments, key diversion).
@@ -513,9 +516,20 @@ def eq_value(setting, raw):
         levels = EQ_PRESETS[text]
         return {k: clamp(levels[i] if i < len(levels) else 0, low, high) for i, k in enumerate(keys)}
     if "=" in text:
-        band, _, level = text.partition("=")
+        band_txt, _, level = text.partition("=")
+        band_txt = band_txt.strip().lower()
+        # Bands are keyed by index but named by frequency ("114Hz"); accept
+        # either the index or any prefix of the name ("0", "114", "114hz").
+        names = [str(k).lower() for k in (getattr(validator, "keys", None) or [])]
+        key = None
+        for i, k in enumerate(keys):
+            if band_txt == str(k) or names[i].startswith(band_txt):
+                key = k
+                break
+        if key is None:
+            raise LogiError(f"no equalizer band matching '{band_txt}' (have: {', '.join(names)})")
         result = dict(current)
-        result[int(band)] = clamp(int(level), low, high)
+        result[key] = clamp(int(level), low, high)
         return result
     levels = [int(part) for part in re.split(r"[,\s]+", text) if part]
     return {k: clamp(levels[i] if i < len(levels) else 0, low, high) for i, k in enumerate(keys)}
