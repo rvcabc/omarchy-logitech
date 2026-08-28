@@ -2,11 +2,13 @@
   "schemaVersion": 1,
   "id": "io.github.rvcabc.logitech",
   "name": "Logitech",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Bryce Corbin",
   "license": "MIT",
   "description": "Battery, DPI, lighting, and sidetone for connected Logitech devices.",
-  "kinds": ["bar-widget"],
+  "kinds": [
+    "bar-widget"
+  ],
   "entryPoints": {
     "barWidget": "Panel.qml"
   },
@@ -14,26 +16,53 @@
     "displayName": "Logitech",
     "description": "Logitech devices: battery at a glance, click for DPI, brightness, lighting, and sidetone.",
     "category": "Hardware",
-    "aliases": ["logitech", "logi", "mouse", "keyboard", "headset"],
+    "aliases": [
+      "logitech",
+      "logi",
+      "mouse",
+      "keyboard",
+      "headset"
+    ],
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
       "refreshIntervalSec": 90,
-      "showBatteryText": true,
+      "batteryStyle": "Percent",
+      "batteryScope": "Weakest device",
       "warnBelowPercent": 20
     },
     "schema": [
+      {
+        "key": "batteryStyle",
+        "type": "enum",
+        "label": "Battery indicator",
+        "options": [
+          "Percent",
+          "Icon",
+          "Bar",
+          "Battery",
+          "Off"
+        ],
+        "defaultValue": "Percent",
+        "description": "How each device's charge is drawn in the bar: a number, the battery glyph ramp, a level bar, a segmented battery outline, or nothing."
+      },
+      {
+        "key": "batteryScope",
+        "type": "enum",
+        "label": "Show battery for",
+        "options": [
+          "Weakest device",
+          "All devices"
+        ],
+        "defaultValue": "Weakest device",
+        "description": "One entry for the device most likely to die first, or one per connected device."
+      },
       {
         "key": "refreshIntervalSec",
         "type": "number",
         "label": "Refresh interval (seconds)",
         "min": 15,
         "max": 900
-      },
-      {
-        "key": "showBatteryText",
-        "type": "boolean",
-        "label": "Show battery percentage in the bar"
       },
       {
         "key": "warnBelowPercent",

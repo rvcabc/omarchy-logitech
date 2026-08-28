@@ -133,3 +133,17 @@ function hexOf(color) {
   if (text.length === 8) text = text.substring(2)  // strip an alpha prefix
   return text.toLowerCase()
 }
+
+// Quartile fill for the drawn battery outline: no bars below 25%, one more
+// per quarter crossed, all four only when actually full.
+function batterySegments(battery) {
+  if (!battery || battery.level === null || battery.level === undefined) return 0
+  return Math.max(0, Math.min(4, Math.floor(Number(battery.level) / 25)))
+}
+
+// Fill fraction for the level-bar style; null when the device reports a
+// battery but no usable level.
+function batteryFraction(battery) {
+  if (!battery || battery.level === null || battery.level === undefined) return 0
+  return Math.max(0, Math.min(1, Number(battery.level) / 100))
+}

@@ -26,6 +26,30 @@ Panel {
   readonly property var devices: logitech.devices
   readonly property bool showBatteryText: setting("showBatteryText", true) !== false
 
+  // How the bar renders each device's charge: "percent" (a number), "icon"
+  // (the nerd-font battery ramp), "bar" (a drawn level bar), "battery" (a
+  // drawn outline with one segment per quarter), or "off". The pre-1.1
+  // showBatteryText toggle is honored when the style was never changed from
+  // its default, so old configs that hid the text keep hiding it.
+  readonly property string batteryStyle: {
+    var style = String(setting("batteryStyle", "Percent")).toLowerCase()
+    if (!showBatteryText && style === "percent") return "off"
+    return style
+  }
+  // "Weakest device" keeps the old single-entry bar; "All devices" gives every
+  // connected device its own glyph and charge indicator.
+  readonly property bool showAllDevices:
+    String(setting("batteryScope", "Weakest device")).toLowerCase().indexOf("all") === 0
+
+  // What the bar button actually renders: one cell per device, or a single
+  // weakest-battery cell. Always at least one cell so the widget never
+  // vanishes from the bar.
+  readonly property var barCells: {
+    if (showAllDevices && devices.length > 0) return devices
+    if (weakest) return [weakest]
+    return devices.length > 0 ? [devices[0]] : [null]
+  }
+
   // --- cursor -------------------------------------------------------------
   // One flat list of navigable rows across every device, so up/down walks the
   // whole panel and each row knows its own index without counting delegates.
@@ -196,18 +220,159 @@ Panel {
     function status(): string { return JSON.stringify(logitech.devices) }
   }
 
+  // Color for one bar cell: the button-wide states (opened, disconnected)
+  // win, then a low battery goes urgent per device.
+  function cellColor(device) {
+    if (root.opened) return root.bar ? root.bar.urgent : Color.urgent
+    if (!logitech.connected || root.devices.length === 0) return Qt.darker(root.barForeground, 1.6)
+    if (device && device.battery && device.battery.low) return root.bar ? root.bar.urgent : Color.urgent
+    return root.barForeground
+  }
+
+  readonly property bool verticalBar: bar ? bar.vertical : false
+
   WidgetButton {
     id: button
     anchors.fill: parent
     bar: root.bar
-    // Glyph and percentage share one label so the bar lays it out as a single
-    // widget, the way the stock battery indicator does.
-    text: root.barGlyph + (root.showBatteryText && root.weakest
+    // Vertical bars keep the old single text label; horizontal bars render
+    // one cell per device below, sized through fixedWidth so the bar still
+    // lays the whole thing out as one widget (see #2).
+    labelVisible: root.verticalBar
+    hasVisualContent: true
+    text: root.barGlyph + (root.batteryStyle !== "off" && root.weakest
       ? " " + Model.batteryText(root.weakest.battery) : "")
+    fixedWidth: root.verticalBar ? -1 : cellRow.implicitWidth + button.scaledHorizontalMargin * 2
     foreground: root.barIconColor
     active: root.opened
     dimmed: !logitech.connected || root.devices.length === 0
     tooltipText: Model.barTooltip(root.devices, logitech.connected, logitech.lastError)
+
+    Row {
+      id: cellRow
+      visible: !root.verticalBar
+      anchors.centerIn: parent
+      spacing: Style.spaceReal(9)
+
+      Repeater {
+        model: root.verticalBar ? [] : root.barCells
+
+        Row {
+          id: cell
+          required property var modelData
+          readonly property var battery: modelData ? modelData.battery : null
+          readonly property color tint: root.cellColor(modelData)
+          // Hide the indicator when there is nothing to say: style off, no
+          // battery reporting, or no usable level for the drawn styles.
+          readonly property bool hasLevel: !!battery
+            && battery.level !== null && battery.level !== undefined
+          spacing: Style.spaceReal(4)
+
+          Text {
+            anchors.verticalCenter: parent.verticalCenter
+            text: modelData ? Model.deviceGlyph(modelData) : "󰍽"
+            color: cell.tint
+            font.family: button.fontFamily
+            font.pixelSize: button.fontSize
+            renderType: Text.NativeRendering
+          }
+
+          // A charging device never looks like a dying one: the icon style
+          // has its own charging ramp, the drawn styles get a bolt.
+          Text {
+            visible: cell.battery && cell.battery.charging
+              && (root.batteryStyle === "bar" || root.batteryStyle === "battery")
+            anchors.verticalCenter: parent.verticalCenter
+            text: "󱐋"
+            color: cell.tint
+            font.family: button.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            renderType: Text.NativeRendering
+          }
+
+          Text {
+            visible: root.batteryStyle === "percent" && !!cell.battery
+            anchors.verticalCenter: parent.verticalCenter
+            text: Model.batteryText(cell.battery)
+            color: cell.tint
+            font.family: button.fontFamily
+            font.pixelSize: button.fontSize
+            renderType: Text.NativeRendering
+          }
+
+          Text {
+            visible: root.batteryStyle === "icon" && !!cell.battery
+            anchors.verticalCenter: parent.verticalCenter
+            text: Model.batteryGlyph(cell.battery)
+            color: cell.tint
+            font.family: button.fontFamily
+            font.pixelSize: button.fontSize
+            renderType: Text.NativeRendering
+          }
+
+          // Level bar: a rounded track with the charge as its fill.
+          Item {
+            visible: root.batteryStyle === "bar" && cell.hasLevel
+            anchors.verticalCenter: parent.verticalCenter
+            width: Style.spaceReal(24)
+            height: Style.spaceReal(6)
+
+            Rectangle {
+              anchors.fill: parent
+              radius: height / 2
+              color: cell.tint
+              opacity: 0.25
+            }
+            Rectangle {
+              width: Math.max(height, parent.width * Model.batteryFraction(cell.battery))
+              height: parent.height
+              radius: height / 2
+              color: cell.tint
+            }
+          }
+
+          // Battery outline with one segment lit per quarter crossed.
+          Row {
+            visible: root.batteryStyle === "battery" && cell.hasLevel
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: 0
+
+            Rectangle {
+              width: Style.spaceReal(21)
+              height: Style.spaceReal(11)
+              radius: Style.spaceReal(2)
+              color: "transparent"
+              border.color: cell.tint
+              border.width: 1
+
+              Row {
+                anchors.fill: parent
+                anchors.margins: Style.spaceReal(2)
+                spacing: Style.spaceReal(1)
+
+                Repeater {
+                  model: 4
+                  Rectangle {
+                    required property int index
+                    width: (parent.width - Style.spaceReal(1) * 3) / 4
+                    height: parent.height
+                    radius: 1
+                    color: cell.tint
+                    opacity: index < Model.batterySegments(cell.battery) ? 1 : 0.15
+                  }
+                }
+              }
+            }
+            Rectangle {
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.spaceReal(2)
+              height: Style.spaceReal(5)
+              color: cell.tint
+            }
+          }
+        }
+      }
+    }
 
     onPressed: function (mouseButton) {
       if (mouseButton === Qt.RightButton) { logitech.matchTheme(); return }
