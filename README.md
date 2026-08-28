@@ -4,9 +4,11 @@
 
 ---
 
-Control your Logitech hardware from the Omarchy bar: battery at a glance, and
-the settings actually worth reaching for — mouse DPI and scroll behavior,
-keyboard brightness and RGB, headset sidetone and equalizer.
+Control your Logitech hardware from the Omarchy bar: battery at a glance, a
+popup with the settings actually worth reaching for — mouse DPI and scroll
+behavior, keyboard brightness and RGB, headset sidetone and equalizer — and a
+full settings window for everything else, from button remapping to a custom
+equalizer curve.
 
 Everything talks HID++ through [Solaar](https://github.com/pwr-Solaar/Solaar)'s
 Python library. No vendor software, no Windows VM, no root.
@@ -90,8 +92,49 @@ left/right adjusts whatever is selected, Enter activates it. Host switching
 takes a deliberate Enter or click — arrow keys will not hand your mouse to
 another machine by accident.
 
-The bar button shows whichever device has the least battery left and turns
+The bar button shows battery for whichever device has the least left and turns
 urgent below 20%. The daemon raises one notification per discharge cycle.
+
+Two widget settings control what the bar draws — set them in the bar's widget
+settings, or inline on the widget's entry in `~/.config/omarchy/shell.json`:
+
+| Setting | Options |
+| --- | --- |
+| `batteryScope` | `Weakest device` (default) — one entry for the device most likely to die first · `All devices` — one glyph and indicator per connected device |
+| `batteryStyle` | `Percent` (default) — a number · `Icon` — the battery glyph ramp · `Bar` — a drawn level bar · `Battery` — a drawn outline lighting one segment per quarter charge · `Off` |
+
+```json
+{ "id": "io.github.rvcabc.logitech", "batteryScope": "All devices", "batteryStyle": "Battery" }
+```
+
+![All-devices mode in the Battery, Bar, and Icon styles](docs/battery-styles.png)
+
+A device that reports no battery (a headset running over USB, say) shows just
+its glyph rather than a fake empty indicator, a low battery tints only its own
+cell urgent, and a charging device gets the charging ramp or a bolt so it never
+reads as a dying one. The pre-1.1 `showBatteryText: false` is still honored
+when `batteryStyle` was never set.
+
+## The settings window
+
+The popup stays curated; the settings window shows everything writable. Open it
+with the gear in the popup header, `s` while the popup is open, or
+`omarchy shell io.github.rvcabc.logitech settings` (a toggle). It
+opens on whichever monitor has focus, one tab per device, Esc or a click
+outside closes it.
+
+- **Controls** — the popup's set, with draggable sliders
+- **Fine tuning** — everything else writable: high-resolution scroll and
+  thumb-wheel modes, and whatever else the device claims
+- **Button behavior** — per-button diversion: `Regular`, `Diverted` (events go
+  to software instead of acting on this machine), `Mouse Gestures`, `Sliding
+  DPI`. The gesture button showing `Diverted` is correct — that is how
+  gestures work; set it `Regular` and gestures stop.
+- **Button assignments** — remap each button to any action the device offers
+- **Equalizer** (headsets) — a preset cycler above one ±12 dB slider per band.
+  Drag any band and the preset reads `custom`; the name comes back when the
+  curve matches a preset again.
+- **Device info** — read-only values, for reference
 
 ## Command line
 
@@ -106,6 +149,8 @@ logi set mx-master-3s dpi 1600
 logi set g915-x-ls brightness_control 50
 logi set pro-x sidetone 30
 logi set pro-x equalizer bass          # flat | bass | vocal | treble | game
+logi set pro-x equalizer 114Hz=-6      # one band, by name, prefix ("114"), or index ("0")
+logi set pro-x equalizer 2,4,0,-3,1    # the whole curve at once
 logi toggle mx-master-3s hires-smooth-invert
 
 logi rgb g915-x-ls static --color 2bb3e6
@@ -116,24 +161,27 @@ logi theme                             # match the current Omarchy theme accent
 
 Device keys are slugs of the device name (`logi list` prints them); any unique
 substring of the name works too. Every command prints one JSON object, so
-failures read as `{"ok": false, "error": ...}` rather than a traceback.
+failures read as `{"ok": false, "error": ...}` rather than a traceback — and
+exit non-zero, so `logi set ... && ...` behaves in scripts.
 
 ## What gets exposed
 
 The panel draws a curated set of settings — the ones worth a bar popup rather
 than every HID++ feature a device claims:
 
-| Device class | Controls |
-| --- | --- |
-| Mice | Battery, DPI, ratchet speed, scroll wheel mode, scroll and thumb-wheel inversion, host switching |
-| Keyboards | Battery, brightness, software lighting, per-zone RGB effects, dim and sleep timeouts |
-| Headsets | Sidetone, 5-band equalizer presets |
+| Device class | Popup | Settings window adds |
+| --- | --- | --- |
+| Mice | Battery, DPI, ratchet speed, scroll wheel mode, scroll and thumb-wheel inversion, host switching | High-resolution scroll modes, per-button diversion and gestures, button remapping |
+| Keyboards | Battery, brightness, software lighting, per-zone RGB effects, dim and sleep timeouts | Whatever else the keyboard exposes |
+| Headsets | Sidetone, equalizer presets | Per-band ±12 dB equalizer sliders |
 
 Developed against an MX Master 3S (Bolt), a G915 X LS (Lightspeed), and a PRO X
 headset (USB). Any other Logitech device Solaar recognizes appears
-automatically; the panel draws the controls it knows how to draw (see
-`CONTROL_SPECS` in `bin/logi`) and quietly ignores the rest. `logi status --all`
-shows everything the device exposes, including what the panel hides.
+automatically; the popup draws the controls it knows how to draw (see
+`CONTROL_SPECS` in `bin/logi`), the settings window draws every writable
+setting generically, and `logi status --all` prints the lot as JSON. The only
+things deliberately hidden are the raw RGB blobs (the lighting UI owns those)
+and the per-key color map (a hundred-row footgun).
 
 ## How it works
 
@@ -142,7 +190,8 @@ shows everything the device exposes, including what the panel hides.
 | `bin/logi` | The whole backend: discovery, reads, writes, and the daemon |
 | `omarchy-logitech.service` | systemd user unit that keeps the daemon running |
 | `Panel.qml` | Bar button and popup |
-| `Service.qml` | Unix-socket client the panel drives |
+| `SettingsWindow.qml` | The full settings window |
+| `Service.qml` | Unix-socket client the panel and window drive |
 | `Model.js` | Glyphs and formatting |
 | `hooks/theme-set.d/` | Optional hook that repaints lighting on theme changes |
 
