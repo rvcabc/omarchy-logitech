@@ -55,6 +55,11 @@ except Exception as exc:  # pragma: no cover - only when solaar is absent
     print(json.dumps({"ok": False, "error": f"solaar is not available: {exc}"}))
     sys.exit(0)
 
+try:
+    from logitech_receiver import rgb_power
+except Exception:  # pragma: no cover - solaar without software rgb power
+    rgb_power = None
+
 
 # ---------------------------------------------------------------------------
 # Which settings reach the panel, and how they should be drawn.
@@ -77,8 +82,12 @@ CONTROL_SPECS = {
     # Keyboard
     "brightness_control": {"order": 10, "label": "Brightness", "unit": "%", "icon": "󰃞"},
     "rgb_control": {"order": 20, "label": "Software lighting", "icon": "󰌌"},
-    "rgb_idle_timeout": {"order": 60, "label": "Dim after", "icon": "󱎫"},
-    "rgb_sleep_timeout": {"order": 70, "label": "Lights off after", "icon": "󰤄"},
+    # Both timeouts are driven by solaar's software power manager, which only
+    # runs while the host holds lighting control.
+    "rgb_idle_timeout": {"order": 60, "label": "Dim after", "icon": "󱎫",
+                         "help": "Needs Software lighting on."},
+    "rgb_sleep_timeout": {"order": 70, "label": "Lights off after", "icon": "󰤄",
+                          "help": "Needs Software lighting on."},
     # Headset
     "sidetone": {"order": 10, "label": "Sidetone", "unit": "%", "icon": "󰋎"},
     "equalizer": {"order": 20, "label": "Equalizer", "icon": "󰺢"},
@@ -100,6 +109,12 @@ ADVANCED_SPECS = {
 }
 
 HIDDEN_SETTINGS = re.compile(r"^(per-key-lighting|rgb_zone_.*|rgb_idle_effect)$")
+
+# Settings solaar implements entirely in software. Their HID++ read is a stub
+# that returns a hardcoded default instead of device state, so reading one live
+# both reports the wrong value and overwrites the cached value that
+# rgb_power seeds its idle/sleep timers from. The cache is the only truth here.
+SOFTWARE_SETTINGS = {"rgb_idle_timeout", "rgb_sleep_timeout", "rgb_idle_effect"}
 
 # Effects worth offering per zone, keyed by HID++ effect ID. The device reports
 # which of these it actually supports; anything it does not claim is dropped
@@ -169,16 +184,63 @@ def _exit(payload=None, human=None):
 
 
 class Index:
-    """The connected devices, with their (expensive to build) settings lists."""
+    """The connected devices, with their (expensive to build) settings lists.
 
-    def __init__(self):
+    `reclaim` re-asserts software lighting control after each rebuild. Only the
+    daemon passes True: a one-shot process (`logi status` with the daemon down)
+    must stay read-only, and any manager it started would die with the process
+    anyway, leaving the keyboard's firmware power management disabled for
+    nothing.
+    """
+
+    def __init__(self, reclaim=False):
         self.entries = []
         self.built_at = 0.0
+        self.reclaim = reclaim
         self._lock = threading.Lock()
 
     def rebuild(self):
         with self._lock:
-            self.entries = discover()
+            fresh = discover()
+            previous = {entry["key"]: entry for entry in self.entries}
+            merged = []
+            for entry in fresh:
+                # A device asleep during the scan answers with no settings and
+                # a shortened name ("G915 X" rather than "G915 X LS"). Letting
+                # that replace a working entry empties the panel until the next
+                # hotplug; the Device object we already have starts answering
+                # again by itself once the device wakes.
+                if entry["settings"]:
+                    merged.append(entry)
+                    continue
+                # Names shift between connection paths ("G915 X" vs "G915 X LS"),
+                # so match on either being a prefix of the other — but never
+                # across kinds, so a mouse cannot adopt a keyboard's entry —
+                # and consume the match so two fresh entries cannot both
+                # claim it.
+                match = next(
+                    (key for key in previous
+                     if (key.startswith(entry["key"]) or entry["key"].startswith(key))
+                     and str(getattr(previous[key]["dev"], "kind", ""))
+                         == str(getattr(entry["dev"], "kind", ""))),
+                    None,
+                )
+                old = previous.pop(match) if match else None
+                merged.append(old if old and old["settings"] else entry)
+            # rgb_power keys its managers by Device object identity, so stop
+            # the managers of Device objects this rebuild just discarded —
+            # otherwise every rebuild leaks one manager per lit keyboard.
+            if rgb_power is not None:
+                kept = {id(entry["dev"]) for entry in merged}
+                for entry in self.entries:
+                    if id(entry["dev"]) not in kept:
+                        try:
+                            rgb_power.stop(entry["dev"])
+                        except Exception:
+                            pass
+            self.entries = merged
+            if self.reclaim:
+                reclaim_lighting(self.entries)
             self.built_at = time.time()
         return self.entries
 
@@ -259,6 +321,38 @@ def discover():
     return keep
 
 
+def reclaim_lighting(entries):
+    """Re-assert software lighting control over a freshly built device list.
+
+    solaar's claim is per-Device-object: rgb_power keys its manager by
+    id(device), and the SetSWControl handshake that disables the keyboard's
+    firmware power management goes with it. Every rebuild hands us brand-new
+    Device objects, so without this the keyboard drops back to its onboard
+    profile and — because the idle and sleep timeouts are driven by that
+    manager — writing either one silently does nothing.
+
+    The claim is idempotent, and it reads the desired state from the cache
+    rather than the device so it follows what the user asked for rather than
+    whatever the firmware reverted to.
+    """
+    for entry in entries:
+        control = next((s for s in entry["settings"] if s.name == "rgb_control"), None)
+        if control is None:
+            continue
+        # Prime the software-only settings first. The claim seeds the manager's
+        # timers from their cached values, and a cached read is what pulls those
+        # out of solaar's config file — without it the manager starts on its
+        # built-in defaults and the saved choices are lost.
+        for setting in entry["settings"]:
+            if setting.name in SOFTWARE_SETTINGS:
+                read_value(setting)
+        try:
+            if control.read(True):
+                control.write(True)
+        except Exception:
+            continue
+
+
 def find_setting(entry, name):
     for setting in entry["settings"]:
         if setting.name == name:
@@ -298,11 +392,39 @@ def battery_of(dev):
     }
 
 
+def cache_only(setting):
+    """Settings whose live read would report — and cache — the wrong value.
+
+    Per-key map state (diversion, remaps) is not readable back from the device
+    at all; solaar tracks it in memory. The software-only rgb_* settings read
+    back a hardcoded stub. Both must come from the cache, which solaar restores
+    from its config file the first time the setting is touched.
+    """
+    return setting.name in SOFTWARE_SETTINGS or int(setting.kind or 0) in (
+        int(Kind.MAP_CHOICE),
+        int(Kind.MULTIPLE_TOGGLE),
+    )
+
+
 def read_value(setting):
     try:
-        return setting.read(False)
+        return setting.read(cache_only(setting))
     except Exception:
         return None
+
+
+def named_choice(setting, value):
+    """The choice matching `value`, so the panel gets a label it can match.
+
+    A value read from the device arrives as a NamedInt and prints as its label
+    ("30 Seconds"). One restored from solaar's config is a bare int and prints
+    as "30", which matches nothing in the choice list — the panel then shows a
+    number and its cycle button starts from the wrong place.
+    """
+    for choice in setting.choices or []:
+        if choice == value:
+            return choice
+    return value
 
 
 def describe_control(setting, include_all=False):
@@ -314,16 +436,7 @@ def describe_control(setting, include_all=False):
         return None
     spec = spec or dict(ADVANCED_SPECS.get(setting.name) or {"order": 500}, label=(ADVANCED_SPECS.get(setting.name) or {}).get("label") or setting.label)
     kind = int(setting.kind or 0)
-    # Per-key map state (diversion, remaps) is not readable back from the
-    # device; solaar tracks it in memory. A live read would overwrite that
-    # tracking with zeros, so map kinds stay on the cache.
-    if kind in (int(Kind.MAP_CHOICE), int(Kind.MULTIPLE_TOGGLE)):
-        try:
-            value = setting.read(True)
-        except Exception:
-            value = None
-    else:
-        value = read_value(setting)
+    value = read_value(setting)
 
     control = {
         "name": setting.name,
@@ -343,7 +456,7 @@ def describe_control(setting, include_all=False):
         choices = [str(c) for c in (setting.choices or [])]
         numeric = bool(choices) and all(str(c).isdigit() for c in choices)
         control["choices"] = choices
-        control["value"] = str(value) if value is not None else ""
+        control["value"] = str(named_choice(setting, value)) if value is not None else ""
         # A "choice" of 157 DPI steps is a slider wearing a disguise.
         if numeric and len(choices) > 8:
             numbers = sorted(int(c) for c in choices)
@@ -805,7 +918,7 @@ class Daemon:
     """
 
     def __init__(self, poll=180, notify_low=True):
-        self.index = Index()
+        self.index = Index(reclaim=True)
         self.poll = poll
         self.notify_low = notify_low
         self.warned = set()
