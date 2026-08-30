@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Shapes
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -20,7 +21,11 @@ Panel {
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
-  readonly property color dim: Qt.darker(foreground, 1.55)
+  // Alpha toward the surface rather than Qt.darker: darkening inverts on
+  // light themes, where a "dim" derived from a dark foreground comes out
+  // heavier than the foreground itself.
+  readonly property color dim: Util.alpha(foreground, 0.58)
+  readonly property color faint: Util.alpha(foreground, 0.38)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
   readonly property var devices: logitech.devices
@@ -421,7 +426,7 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(400))
+    contentWidth: panel.fittedContentWidth(Style.space(420))
     // Three devices with lighting run tall; the helper still clamps this to
     // whatever the screen actually has.
     contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(1180))
@@ -502,27 +507,69 @@ Panel {
             }
           }
 
-          Text {
+          // Transient action feedback and daemon errors, as a tinted banner
+          // rather than a bare line of text.
+          Rectangle {
             visible: logitech.actionStatus !== "" || logitech.lastError !== ""
             width: parent.width
-            text: logitech.actionStatus !== "" ? logitech.actionStatus : logitech.lastError
-            textFormat: Text.PlainText
-            color: logitech.lastError !== "" && logitech.actionStatus === "" ? root.urgent : root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            wrapMode: Text.WordWrap
+            readonly property bool isError: logitech.lastError !== "" && logitech.actionStatus === ""
+            radius: Style.cornerRadius
+            color: Util.alpha(isError ? root.urgent : root.foreground, 0.08)
+            border.width: Style.normalBorderWidth
+            border.color: Util.alpha(isError ? root.urgent : root.foreground, 0.18)
+            implicitHeight: statusLabel.implicitHeight + Style.space(12)
+
+            Text {
+              id: statusLabel
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.leftMargin: Style.space(10)
+              anchors.rightMargin: Style.space(10)
+              text: logitech.actionStatus !== "" ? logitech.actionStatus : logitech.lastError
+              textFormat: Text.PlainText
+              color: parent.isError ? root.urgent : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+            }
           }
 
-          Text {
+          Column {
             visible: logitech.connected && root.devices.length === 0
             width: parent.width
-            text: "No Logitech devices found.\nPlug one in, or switch a wireless device on."
-            textFormat: Text.PlainText
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.body
-            horizontalAlignment: Text.AlignHCenter
-            wrapMode: Text.WordWrap
+            spacing: Style.space(4)
+            topPadding: Style.space(12)
+            bottomPadding: Style.space(12)
+
+            Text {
+              width: parent.width
+              text: "󰍽"
+              textFormat: Text.PlainText
+              color: root.faint
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.display
+              horizontalAlignment: Text.AlignHCenter
+            }
+            Text {
+              width: parent.width
+              text: "No Logitech devices found"
+              textFormat: Text.PlainText
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              horizontalAlignment: Text.AlignHCenter
+            }
+            Text {
+              width: parent.width
+              text: "Plug one in, or switch a wireless device on."
+              textFormat: Text.PlainText
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              horizontalAlignment: Text.AlignHCenter
+              wrapMode: Text.WordWrap
+            }
           }
 
           Repeater {
@@ -540,95 +587,160 @@ Panel {
 
   // --- device section -----------------------------------------------------
 
-  component DeviceSection: Column {
+  // One card per device: ring-wrapped glyph and battery up top, then the
+  // control rows. The card surface is what separates devices — no hairlines.
+  component DeviceSection: Rectangle {
     id: section
     property var device: null
     readonly property var battery: device ? device.battery : null
 
-    spacing: Style.space(8)
+    radius: Style.cornerRadius
+    color: Util.alpha(root.foreground, 0.05)
+    border.width: Style.normalBorderWidth
+    border.color: Util.alpha(root.foreground, 0.10)
+    implicitHeight: sectionBody.implicitHeight + Style.space(20)
 
-    Item { width: 1; height: Style.space(2) }
+    Column {
+      id: sectionBody
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(8)
+      anchors.rightMargin: Style.space(8)
+      spacing: Style.space(6)
 
-    RowLayout {
-      width: parent.width
-      spacing: Style.space(8)
+      Item {
+        width: parent.width
+        implicitHeight: header.implicitHeight
 
-      Text {
-        text: Model.deviceGlyph(section.device)
-        textFormat: Text.PlainText
-        color: root.foreground
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.icon
-        Layout.alignment: Qt.AlignVCenter
-      }
+        RowLayout {
+          id: header
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.leftMargin: Style.space(2)
+          anchors.rightMargin: Style.space(2)
+          spacing: Style.space(10)
 
-      ColumnLayout {
-        Layout.fillWidth: true
-        spacing: Style.space(1)
+          BatteryRing {
+            device: section.device
+            Layout.alignment: Qt.AlignVCenter
+          }
 
-        Text {
-          Layout.fillWidth: true
-          text: section.device ? section.device.name : ""
-          textFormat: Text.PlainText
-          color: root.foreground
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.body
-          elide: Text.ElideRight
+          ColumnLayout {
+            Layout.fillWidth: true
+            spacing: Style.space(1)
+
+            Text {
+              Layout.fillWidth: true
+              text: section.device ? section.device.name : ""
+              textFormat: Text.PlainText
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.subtitle
+              font.weight: Font.DemiBold
+              elide: Text.ElideRight
+            }
+
+            Text {
+              Layout.fillWidth: true
+              text: section.device ? (section.device.via === "USB" ? "USB" : section.device.via) : ""
+              textFormat: Text.PlainText
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+            }
+          }
+
+          Text {
+            visible: !!section.battery
+            text: (section.battery && section.battery.charging ? "󱐋 " : "")
+              + Model.batteryText(section.battery)
+            textFormat: Text.PlainText
+            color: section.battery && section.battery.low ? root.urgent : root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.subtitle
+            Layout.alignment: Qt.AlignVCenter
+          }
         }
+      }
 
-        Text {
-          Layout.fillWidth: true
-          text: section.device ? (section.device.via === "USB" ? "USB" : section.device.via) : ""
-          textFormat: Text.PlainText
-          color: root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          elide: Text.ElideRight
+      Repeater {
+        model: section.device ? section.device.controls : []
+        ControlRow {
+          required property var modelData
+          width: sectionBody.width
+          deviceKey: section.device.key
+          control: modelData
         }
       }
 
-      Text {
-        visible: !!section.battery
-        text: Model.batteryGlyph(section.battery)
-        textFormat: Text.PlainText
-        color: section.battery && section.battery.low ? root.urgent : root.foreground
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.icon
-        Layout.alignment: Qt.AlignVCenter
+      LightingRow {
+        visible: !!(section.device && section.device.rgb && section.device.rgb.zones.length > 0)
+        width: sectionBody.width
+        device: section.device
+      }
+    }
+  }
+
+  // The device glyph wrapped in a charge ring: the arc sweeps to the battery
+  // level, goes urgent when low, and animates between reads. No battery
+  // reporting leaves just the faint track.
+  component BatteryRing: Item {
+    id: ring
+    property var device: null
+    readonly property var battery: device ? device.battery : null
+    readonly property color tint: battery && battery.low ? root.urgent : root.foreground
+    readonly property real strokeW: Math.max(2, Style.spaceReal(2))
+
+    width: Style.space(36)
+    height: width
+
+    Shape {
+      anchors.fill: parent
+      preferredRendererType: Shape.CurveRenderer
+
+      ShapePath {
+        strokeWidth: ring.strokeW
+        strokeColor: Util.alpha(ring.tint, 0.15)
+        fillColor: "transparent"
+        capStyle: ShapePath.RoundCap
+        PathAngleArc {
+          centerX: ring.width / 2
+          centerY: ring.height / 2
+          radiusX: ring.width / 2 - ring.strokeW
+          radiusY: ring.height / 2 - ring.strokeW
+          startAngle: -90
+          sweepAngle: 360
+        }
       }
 
-      Text {
-        visible: !!section.battery
-        text: Model.batteryText(section.battery)
-        textFormat: Text.PlainText
-        color: section.battery && section.battery.low ? root.urgent : root.foreground
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.bodySmall
-        Layout.alignment: Qt.AlignVCenter
+      ShapePath {
+        strokeWidth: ring.strokeW
+        strokeColor: ring.tint
+        fillColor: "transparent"
+        capStyle: ShapePath.RoundCap
+        PathAngleArc {
+          centerX: ring.width / 2
+          centerY: ring.height / 2
+          radiusX: ring.width / 2 - ring.strokeW
+          radiusY: ring.height / 2 - ring.strokeW
+          startAngle: -90
+          sweepAngle: 360 * Model.batteryFraction(ring.battery)
+          Behavior on sweepAngle {
+            NumberAnimation { duration: 600; easing.type: Easing.OutCubic }
+          }
+        }
       }
     }
 
-    Repeater {
-      model: section.device ? section.device.controls : []
-      ControlRow {
-        required property var modelData
-        width: section.width
-        deviceKey: section.device.key
-        control: modelData
-      }
-    }
-
-    LightingRow {
-      visible: !!(section.device && section.device.rgb && section.device.rgb.zones.length > 0)
-      width: section.width
-      device: section.device
-    }
-
-    PanelSeparator {
-      width: section.width
-      foreground: root.foreground
-      visible: root.devices.length > 1 && section.device
-        && root.devices[root.devices.length - 1].key !== section.device.key
+    Text {
+      anchors.centerIn: parent
+      text: Model.deviceGlyph(ring.device)
+      textFormat: Text.PlainText
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.title
     }
   }
 
@@ -928,9 +1040,15 @@ Panel {
               Model.hexOf(lighting.activeColor) === Model.hexOf(modelData.color)
             color: modelData.color
             border.width: picked ? Style.normalBorderWidth * 2 : Style.normalBorderWidth
-            border.color: picked ? root.foreground : Util.alpha(root.foreground, 0.35)
+            border.color: picked ? root.foreground
+              : Util.alpha(root.foreground, swatchMouse.containsMouse ? 0.7 : 0.35)
+            scale: swatchMouse.containsMouse ? 1.12 : 1
+
+            Behavior on border.color { ColorAnimation { duration: 120 } }
+            Behavior on scale { NumberAnimation { duration: 100; easing.type: Easing.OutCubic } }
 
             MouseArea {
+              id: swatchMouse
               anchors.fill: parent
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
@@ -971,6 +1089,11 @@ Panel {
       : (hot ? Style.hoverFillFor(root.foreground, Color.accent) : "transparent")
     border.width: Style.normalBorderWidth
     border.color: selected ? Util.alpha(root.foreground, 0.55) : Util.alpha(root.foreground, 0.22)
+    scale: chipMouse.pressed ? 0.95 : 1
+
+    Behavior on color { ColorAnimation { duration: 120 } }
+    Behavior on border.color { ColorAnimation { duration: 120 } }
+    Behavior on scale { NumberAnimation { duration: 80; easing.type: Easing.OutCubic } }
 
     Text {
       id: chipLabel

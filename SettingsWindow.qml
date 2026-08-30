@@ -51,8 +51,11 @@ PanelWindow {
   // Menu surface tokens, like the clipboard picker — themes that style the
   // menu style this window too.
   readonly property color foreground: Color.menu.text
-  readonly property color dim: Qt.darker(foreground, 1.55)
-  readonly property color faint: Qt.darker(foreground, 2.2)
+  // Alpha toward the surface rather than Qt.darker: darkening inverts on
+  // light themes (near-black "faint" tab borders outweighing the accent
+  // border on the active tab).
+  readonly property color dim: Util.alpha(foreground, 0.58)
+  readonly property color faint: Util.alpha(foreground, 0.38)
   readonly property color urgent: Color.urgent
   readonly property color accent: service && service.accent ? service.accent : Color.foreground
 
@@ -151,6 +154,10 @@ PanelWindow {
       ColumnLayout {
         id: cardColumn
         width: parent.width
+        // Track the card's clamped height so the body Flickable can shrink on
+        // short screens instead of overflowing the card; when the card is
+        // content-sized this equals implicitHeight and changes nothing.
+        height: parent.height
         spacing: Style.space(10)
 
         // --- header: title, device tabs, close --------------------------
@@ -198,38 +205,46 @@ PanelWindow {
           Repeater {
             model: root.devices
             Rectangle {
+              id: tab
               required property var modelData
               readonly property bool active: root.current && root.current.key === modelData.key
               width: tabRow.implicitWidth + Style.space(20)
               height: tabRow.implicitHeight + Style.space(10)
               radius: height / 2
-              color: active ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12) : "transparent"
-              border.color: active ? root.foreground : root.faint
+              color: active ? Style.selectedFillFor(root.foreground, root.accent)
+                : (tabMouse.containsMouse
+                  ? Style.hoverFillFor(root.foreground, root.accent) : "transparent")
+              border.color: active ? Util.alpha(root.accent, 0.9) : root.faint
               border.width: 1
+
+              Behavior on color { ColorAnimation { duration: 120 } }
+              Behavior on border.color { ColorAnimation { duration: 120 } }
 
               Row {
                 id: tabRow
                 anchors.centerIn: parent
                 spacing: Style.space(6)
                 Text {
-                  text: Model.deviceGlyph(parent.parent.modelData)
+                  text: Model.deviceGlyph(tab.modelData)
                   textFormat: Text.PlainText
-                  color: parent.parent.active ? root.foreground : root.dim
+                  color: tab.active ? root.foreground : root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
                 }
                 Text {
-                  text: parent.parent.modelData.name
+                  text: tab.modelData.name
                   textFormat: Text.PlainText
-                  color: parent.parent.active ? root.foreground : root.dim
+                  color: tab.active ? root.foreground : root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
                 }
               }
               MouseArea {
+                id: tabMouse
                 anchors.fill: parent
+                hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
-                onClicked: root.selectedKey = parent.modelData.key
+                onClicked: root.selectedKey = tab.modelData.key
               }
             }
           }
@@ -252,6 +267,10 @@ PanelWindow {
           id: flick
           Layout.fillWidth: true
           Layout.preferredHeight: Math.min(body.implicitHeight, Style.space(680))
+          // On a screen too short for header + tabs + 680px of body, give back
+          // height instead of overflowing the card (which does not clip).
+          Layout.fillHeight: true
+          Layout.maximumHeight: Math.min(body.implicitHeight, Style.space(680))
           contentWidth: width
           contentHeight: body.implicitHeight
           clip: true
@@ -267,18 +286,26 @@ PanelWindow {
             id: body
             // Keep the rows clear of the scrollbar overlay.
             width: flick.width - Style.spaceReal(10)
-            spacing: Style.space(6)
+            spacing: Style.space(12)
 
-            SectionHeader { title: "Controls"; visible: root.groupOf(root.current, "controls").length > 0 }
-            Repeater {
-              model: root.groupOf(root.current, "controls")
-              SettingRow { required property var modelData; width: body.width; control: modelData }
+            SectionCard {
+              width: body.width
+              title: "Controls"
+              visible: root.groupOf(root.current, "controls").length > 0
+              Repeater {
+                model: root.groupOf(root.current, "controls")
+                SettingRow { required property var modelData; width: parent.width; control: modelData }
+              }
             }
 
-            SectionHeader { title: "Fine tuning"; visible: root.groupOf(root.current, "tuning").length > 0 }
-            Repeater {
-              model: root.groupOf(root.current, "tuning")
-              SettingRow { required property var modelData; width: body.width; control: modelData }
+            SectionCard {
+              width: body.width
+              title: "Fine tuning"
+              visible: root.groupOf(root.current, "tuning").length > 0
+              Repeater {
+                model: root.groupOf(root.current, "tuning")
+                SettingRow { required property var modelData; width: parent.width; control: modelData }
+              }
             }
 
             Repeater {
@@ -291,44 +318,65 @@ PanelWindow {
               KeymapSection { required property var modelData; width: body.width; control: modelData }
             }
 
-            SectionHeader { title: "Device info"; visible: root.groupOf(root.current, "info").length > 0 }
-            Repeater {
-              model: root.groupOf(root.current, "info")
-              RowLayout {
-                required property var modelData
-                width: body.width
-                spacing: Style.space(8)
-                Text {
-                  text: modelData.label
-                  textFormat: Text.PlainText
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.bodySmall
-                }
-                Item { Layout.fillWidth: true }
-                Text {
-                  Layout.maximumWidth: body.width * 0.55
-                  text: String(modelData.value)
-                  textFormat: Text.PlainText
-                  color: root.faint
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.bodySmall
-                  elide: Text.ElideRight
+            SectionCard {
+              width: body.width
+              title: "Device info"
+              visible: root.groupOf(root.current, "info").length > 0
+              Repeater {
+                model: root.groupOf(root.current, "info")
+                RowLayout {
+                  id: infoRow
+                  required property var modelData
+                  width: parent.width
+                  spacing: Style.space(8)
+                  Text {
+                    text: infoRow.modelData.label
+                    textFormat: Text.PlainText
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                  }
+                  Item { Layout.fillWidth: true }
+                  Text {
+                    Layout.maximumWidth: infoRow.width * 0.55
+                    text: String(infoRow.modelData.value)
+                    textFormat: Text.PlainText
+                    color: root.faint
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    elide: Text.ElideRight
+                  }
                 }
               }
             }
           }
         }
 
-        Text {
+        Rectangle {
           Layout.fillWidth: true
           visible: !!(root.service && (root.service.actionStatus !== "" || root.service.lastError !== ""))
-          text: root.service ? (root.service.actionStatus !== "" ? root.service.actionStatus : root.service.lastError) : ""
-          textFormat: Text.PlainText
-          color: root.service && root.service.lastError !== "" && root.service.actionStatus === "" ? root.urgent : root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.bodySmall
-          wrapMode: Text.WordWrap
+          readonly property bool isError:
+            !!(root.service && root.service.lastError !== "" && root.service.actionStatus === "")
+          radius: Style.cornerRadius
+          color: Util.alpha(isError ? root.urgent : root.foreground, 0.08)
+          border.width: Style.normalBorderWidth
+          border.color: Util.alpha(isError ? root.urgent : root.foreground, 0.18)
+          implicitHeight: settingsStatus.implicitHeight + Style.space(12)
+
+          Text {
+            id: settingsStatus
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.leftMargin: Style.space(10)
+            anchors.rightMargin: Style.space(10)
+            text: root.service ? (root.service.actionStatus !== "" ? root.service.actionStatus : root.service.lastError) : ""
+            textFormat: Text.PlainText
+            color: parent.isError ? root.urgent : root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
         }
       }
     }
@@ -336,21 +384,50 @@ PanelWindow {
 
   // --- building blocks ------------------------------------------------------
 
-  component SectionHeader: Column {
+  // A titled group: caption label floating above a rounded surface that holds
+  // the rows. Children declared on a SectionCard land inside the surface.
+  // The component's own children are assigned through `data:` explicitly —
+  // otherwise they would route through the default alias into cardInner,
+  // which does not exist yet at that point.
+  component SectionCard: Column {
+    id: sectionCard
     property string title: ""
-    width: parent ? parent.width : 0
-    topPadding: Style.space(8)
-    spacing: Style.space(4)
-    Text {
-      text: parent.title
-      textFormat: Text.PlainText
-      color: root.dim
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.caption
-      font.letterSpacing: 1.2
-      font.capitalization: Font.AllUppercase
-    }
-    Rectangle { width: parent.width; height: 1; color: root.faint; opacity: 0.5 }
+    default property alias content: cardInner.data
+    spacing: Style.space(6)
+
+    data: [
+      Text {
+        visible: sectionCard.title !== ""
+        width: sectionCard.width
+        leftPadding: Style.space(4)
+        text: sectionCard.title
+        textFormat: Text.PlainText
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        font.letterSpacing: 1.2
+        font.capitalization: Font.AllUppercase
+        elide: Text.ElideRight
+      },
+      Rectangle {
+        width: sectionCard.width
+        height: cardInner.implicitHeight + Style.space(20)
+        radius: Style.cornerRadius
+        color: Util.alpha(root.foreground, 0.04)
+        border.width: Style.normalBorderWidth
+        border.color: Util.alpha(root.foreground, 0.10)
+
+        Column {
+          id: cardInner
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          anchors.leftMargin: Style.space(12)
+          anchors.rightMargin: Style.space(12)
+          spacing: Style.space(6)
+        }
+      }
+    ]
   }
 
   // One writable setting: label (plus optional help line) left, the control
@@ -399,6 +476,9 @@ PanelWindow {
         ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.55) : "transparent"
       border.color: row.control && row.control.value ? root.accent : root.dim
       border.width: 1
+
+      Behavior on color { ColorAnimation { duration: 140 } }
+      Behavior on border.color { ColorAnimation { duration: 140 } }
 
       Rectangle {
         width: parent.height - Style.space(6)
@@ -475,10 +555,9 @@ PanelWindow {
     Rectangle {
       anchors.verticalCenter: parent.verticalCenter
       width: parent.width
-      height: Style.space(5)
+      height: Style.spaceReal(6)
       radius: height / 2
-      color: root.dim
-      opacity: 0.35
+      color: Util.alpha(root.foreground, 0.15)
     }
     // For a bipolar range the fill grows from the zero point, so a flat EQ
     // band reads as neutral rather than half full.
@@ -487,20 +566,26 @@ PanelWindow {
       anchors.verticalCenter: parent.verticalCenter
       x: parent.width * Math.min(slider.zeroFraction, slider.fraction)
       width: Math.max(Style.space(3), parent.width * Math.abs(slider.fraction - slider.zeroFraction))
-      height: Style.space(5)
+      height: Style.spaceReal(6)
       radius: height / 2
       color: root.accent
     }
     Rectangle {
       x: Math.max(0, Math.min(parent.width - width, parent.width * slider.fraction - width / 2))
       anchors.verticalCenter: parent.verticalCenter
-      width: Style.space(12)
+      width: Style.space(13)
       height: width
       radius: width / 2
       color: root.foreground
+      border.width: Math.max(1, Style.spaceReal(2))
+      border.color: root.accent
+      scale: sliderMouse.pressed ? 1.25 : (sliderMouse.containsMouse ? 1.15 : 1)
+      Behavior on scale { NumberAnimation { duration: 100; easing.type: Easing.OutCubic } }
     }
     MouseArea {
+      id: sliderMouse
       anchors.fill: parent
+      hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
       function valueAt(x) {
         var fraction = Math.max(0, Math.min(1, x / slider.width))
@@ -523,7 +608,6 @@ PanelWindow {
     property var control: null
     readonly property string deviceKey: root.current ? root.current.key : ""
     readonly property var curve: root.toArray(control ? control.value : null)
-    spacing: Style.space(4)
 
     function presetName() {
       var values = eq.control ? eq.control.presetValues : null
@@ -536,84 +620,87 @@ PanelWindow {
       return "custom"
     }
 
-    SectionHeader { title: eq.control ? eq.control.label : "Equalizer" }
+    SectionCard {
+      width: eq.width
+      title: eq.control ? eq.control.label : "Equalizer"
 
-
-    Item {
-      width: parent.width
-      implicitHeight: Style.space(30)
-      Text {
-        anchors.verticalCenter: parent.verticalCenter
-        text: "Preset"
-        textFormat: Text.PlainText
-        color: root.foreground
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.body
-      }
-      ChoiceCycler {
-        anchors.right: parent.right
-        anchors.verticalCenter: parent.verticalCenter
-        text: eq.presetName()
-        onCycle: function (direction) {
-          var names = root.toArray(eq.control ? eq.control.presets : null)
-          if (names.length === 0) return
-          var index = names.indexOf(eq.presetName())
-          index = index < 0 ? (direction > 0 ? 0 : names.length - 1)
-            : (index + direction + names.length) % names.length
-          root.service.setEqualizer(eq.deviceKey, names[index])
-        }
-      }
-    }
-
-    Repeater {
-      model: eq.control ? (eq.control.bands || []) : []
       Item {
-        id: bandRow
-        required property var modelData
-        required property int index
-        width: eq.width
-        implicitHeight: Style.space(26)
-
+        width: parent.width
+        implicitHeight: Style.space(30)
         Text {
           anchors.verticalCenter: parent.verticalCenter
-          text: bandRow.modelData
+          text: "Preset"
           textFormat: Text.PlainText
-          color: root.dim
+          color: root.foreground
           font.family: root.fontFamily
-          font.pixelSize: Style.font.bodySmall
+          font.pixelSize: Style.font.body
         }
-        Row {
+        ChoiceCycler {
           anchors.right: parent.right
           anchors.verticalCenter: parent.verticalCenter
-          spacing: Style.space(8)
-
-          HSlider {
-            id: bandSlider
-            anchors.verticalCenter: parent.verticalCenter
-            min: eq.control ? Number(eq.control.min) : -12
-            max: eq.control ? Number(eq.control.max) : 12
-            value: eq.curve.length > bandRow.index ? Number(eq.curve[bandRow.index]) : 0
-            onCommitted: function (v) {
-              // Band name ("114Hz") — the daemon matches it case-insensitively.
-              root.service.setEqualizerBand(eq.deviceKey, bandRow.index, bandRow.modelData, v)
-            }
+          text: eq.presetName()
+          onCycle: function (direction) {
+            var names = root.toArray(eq.control ? eq.control.presets : null)
+            if (names.length === 0) return
+            var index = names.indexOf(eq.presetName())
+            index = index < 0 ? (direction > 0 ? 0 : names.length - 1)
+              : (index + direction + names.length) % names.length
+            root.service.setEqualizer(eq.deviceKey, names[index])
           }
+        }
+      }
+
+      Repeater {
+        model: eq.control ? (eq.control.bands || []) : []
+        Item {
+          id: bandRow
+          required property var modelData
+          required property int index
+          width: parent.width
+          implicitHeight: Style.space(26)
+
           Text {
             anchors.verticalCenter: parent.verticalCenter
-            width: Style.space(64)
-            horizontalAlignment: Text.AlignRight
-            text: (bandSlider.shown > 0 ? "+" : "") + Math.round(bandSlider.shown) + " dB"
+            text: bandRow.modelData
             textFormat: Text.PlainText
-            color: root.foreground
+            color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
+          }
+          Row {
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(8)
+
+            HSlider {
+              id: bandSlider
+              anchors.verticalCenter: parent.verticalCenter
+              min: eq.control ? Number(eq.control.min) : -12
+              max: eq.control ? Number(eq.control.max) : 12
+              value: eq.curve.length > bandRow.index ? Number(eq.curve[bandRow.index]) : 0
+              onCommitted: function (v) {
+                // Band name ("114Hz") — the daemon matches it case-insensitively.
+                root.service.setEqualizerBand(eq.deviceKey, bandRow.index, bandRow.modelData, v)
+              }
+            }
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(64)
+              horizontalAlignment: Text.AlignRight
+              text: (bandSlider.shown > 0 ? "+" : "") + Math.round(bandSlider.shown) + " dB"
+              textFormat: Text.PlainText
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
           }
         }
       }
     }
   }
 
-  // ‹ value › — cycles through a closed set of options.
+  // ‹ value › — cycles through a closed set of options. The value sits in a
+  // pill so it reads as a control, not a caption.
   component ChoiceCycler: Row {
     id: cycler
     property string text: ""
@@ -626,16 +713,28 @@ PanelWindow {
       fontFamily: root.fontFamily
       onClicked: cycler.cycle(-1)
     }
-    Text {
+    Rectangle {
       anchors.verticalCenter: parent.verticalCenter
-      width: Style.space(110)
-      horizontalAlignment: Text.AlignHCenter
-      text: cycler.text
-      textFormat: Text.PlainText
-      color: root.foreground
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.bodySmall
-      elide: Text.ElideMiddle
+      width: Style.space(114)
+      height: Style.space(24)
+      radius: height / 2
+      color: Util.alpha(root.foreground, 0.06)
+      border.width: Style.normalBorderWidth
+      border.color: Util.alpha(root.foreground, 0.15)
+
+      Text {
+        anchors.fill: parent
+        anchors.leftMargin: Style.space(8)
+        anchors.rightMargin: Style.space(8)
+        horizontalAlignment: Text.AlignHCenter
+        verticalAlignment: Text.AlignVCenter
+        text: cycler.text
+        textFormat: Text.PlainText
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        elide: Text.ElideMiddle
+      }
     }
     PanelActionButton {
       iconText: "󰅂"
@@ -651,53 +750,55 @@ PanelWindow {
     id: keymap
     property var control: null
     readonly property string deviceKey: root.current ? root.current.key : ""
-    spacing: Style.space(2)
 
-    SectionHeader { title: keymap.control ? keymap.control.label : "" }
+    SectionCard {
+      width: keymap.width
+      title: keymap.control ? keymap.control.label : ""
 
-    Text {
-      visible: !!(keymap.control && keymap.control.help)
-      width: parent.width
-      text: keymap.control ? keymap.control.help : ""
-      textFormat: Text.PlainText
-      color: root.faint
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.caption
-      wrapMode: Text.WordWrap
-    }
+      Text {
+        visible: !!(keymap.control && keymap.control.help)
+        width: parent.width
+        text: keymap.control ? keymap.control.help : ""
+        textFormat: Text.PlainText
+        color: root.faint
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
 
-    Repeater {
-      model: keymap.control ? keymap.control.items : []
-      Item {
-        required property var modelData
-        width: keymap.width
-        implicitHeight: Style.space(30)
+      Repeater {
+        model: keymap.control ? keymap.control.items : []
+        Item {
+          required property var modelData
+          width: parent.width
+          implicitHeight: Style.space(30)
 
-        Text {
-          anchors.verticalCenter: parent.verticalCenter
-          text: modelData.label
-          textFormat: Text.PlainText
-          color: root.foreground
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.body
-        }
-        ChoiceCycler {
-          anchors.right: parent.right
-          anchors.verticalCenter: parent.verticalCenter
-          text: {
-            var options = modelData.choices || []
-            for (var i = 0; i < options.length; i++) {
-              if (options[i].id === modelData.value) return options[i].label
-            }
-            return modelData.value === null ? "—" : String(modelData.value)
+          Text {
+            anchors.verticalCenter: parent.verticalCenter
+            text: modelData.label
+            textFormat: Text.PlainText
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
           }
-          onCycle: function (direction) {
-            var options = modelData.choices || []
-            if (options.length === 0) return
-            var index = 0
-            for (var i = 0; i < options.length; i++) if (options[i].id === modelData.value) index = i
-            index = (index + direction + options.length) % options.length
-            root.service.setMapItem(keymap.deviceKey, keymap.control.name, modelData.id, options[index].id)
+          ChoiceCycler {
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            text: {
+              var options = modelData.choices || []
+              for (var i = 0; i < options.length; i++) {
+                if (options[i].id === modelData.value) return options[i].label
+              }
+              return modelData.value === null ? "—" : String(modelData.value)
+            }
+            onCycle: function (direction) {
+              var options = modelData.choices || []
+              if (options.length === 0) return
+              var index = 0
+              for (var i = 0; i < options.length; i++) if (options[i].id === modelData.value) index = i
+              index = (index + direction + options.length) % options.length
+              root.service.setMapItem(keymap.deviceKey, keymap.control.name, modelData.id, options[index].id)
+            }
           }
         }
       }
