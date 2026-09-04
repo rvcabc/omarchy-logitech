@@ -528,6 +528,12 @@ def describe_rgb(dev, settings=None):
     by_name = {s.name: s for s in (settings or [])}
     zones = []
     for zone in infos.zones:
+        # solaar names the settings rgb_zone_1..n, one past the zone index.
+        # Devices without RGB_EFFECTS lack rgb_zone_* settings.
+        index = int(zone.index) + 1
+        setting = by_name.get(f"rgb_zone_{index}")
+        if setting is None:
+            continue
         effects = []
         for effect in getattr(zone, "effects", []):
             known = RGB_EFFECTS.get(int(effect.ID))
@@ -535,14 +541,12 @@ def describe_rgb(dev, settings=None):
                 effects.append({"id": int(effect.ID), **known})
         if not effects:
             continue
-        # solaar names the settings rgb_zone_1..n, one past the zone index.
-        index = int(zone.index) + 1
         zones.append(
             {
                 "index": index,
                 "location": str(getattr(zone, "location", f"Zone {zone.index}")),
                 "effects": effects,
-                "current": current_effect(by_name.get(f"rgb_zone_{index}")),
+                "current": current_effect(setting),
             }
         )
     return {"zones": zones} if zones else None
@@ -730,7 +734,7 @@ def apply_rgb(entry, slug, color, period, zones):
     from logitech_receiver.hidpp20 import LEDEffectSetting
 
     effect_id, effect = effect_by_slug(slug)
-    rgb = describe_rgb(entry["dev"]) or {"zones": []}
+    rgb = describe_rgb(entry["dev"], entry["settings"]) or {"zones": []}
     targets = rgb["zones"]
     if zones and str(zones) != "all":
         wanted = {int(z) for z in str(zones).split(",")}
@@ -847,7 +851,7 @@ def handle(index, request):
             raise LogiError("could not read an accent color from the current Omarchy theme")
         applied = []
         for entry in index.all():
-            if describe_rgb(entry["dev"]):
+            if describe_rgb(entry["dev"], entry["settings"]):
                 applied.append(apply_rgb(entry, request.get("effect", "static"), color, request.get("period", 5000), "all"))
         if not applied:
             raise LogiError("no device with controllable lighting is connected")
