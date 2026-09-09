@@ -837,6 +837,9 @@ Panel {
         integer: true
         value: row.control && row.control.ui === "slider" ? Number(row.control.value) : 0
         onMoved: function (v) {
+          logitech.applyLocally(row.deviceKey, row.controlName, Model.snapToStep(row.control, v))
+        }
+        onReleased: function (v) {
           logitech.setControl(row.deviceKey, row.controlName, Model.snapToStep(row.control, v))
         }
       }
