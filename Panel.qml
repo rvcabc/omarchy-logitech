@@ -837,7 +837,30 @@ Panel {
         integer: true
         value: row.control && row.control.ui === "slider" ? Number(row.control.value) : 0
         onMoved: function (v) {
+          logitech.applyLocally(row.deviceKey, row.controlName, Model.snapToStep(row.control, v))
+        }
+        onReleased: function (v) {
           logitech.setControl(row.deviceKey, row.controlName, Model.snapToStep(row.control, v))
+        }
+      }
+
+      // Quick presets for sliders (such as standard mouse DPI steps)
+      Flow {
+        visible: !!row.control && row.control.ui === "slider" && !!row.control.presets && row.control.presets.length > 0
+        Layout.fillWidth: true
+        spacing: Style.space(6)
+
+        Repeater {
+          model: row.control && row.control.presets ? row.control.presets : []
+          Chip {
+            required property var modelData
+            text: String(modelData)
+            selected: row.control && Number(row.control.value) === Number(modelData)
+            onClicked: {
+              root.setCursor(row.deviceKey, row.controlName)
+              logitech.setControl(row.deviceKey, row.controlName, Number(modelData))
+            }
+          }
         }
       }
 

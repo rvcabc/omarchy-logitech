@@ -480,6 +480,9 @@ def describe_control(setting, include_all=False):
             control["max"] = numbers[-1]
             control["step"] = numbers[1] - numbers[0] if len(numbers) > 1 else 1
             control["value"] = int(value) if value is not None else numbers[0]
+            if setting.name == "dpi":
+                common_dpis = [400, 800, 1200, 1600, 2400, 3200, 6400]
+                control["presets"] = [c for c in common_dpis if str(c) in choices]
         else:
             control["ui"] = "choice"
     elif kind == int(Kind.RANGE):

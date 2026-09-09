@@ -512,7 +512,24 @@ PanelWindow {
       visible: !!(row.control && row.control.ui === "slider")
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
-      spacing: Style.space(8)
+      spacing: Style.space(6)
+
+      PanelActionButton {
+        visible: !!(row.control && row.control.presets && row.control.presets.length > 0)
+        anchors.verticalCenter: parent.verticalCenter
+        iconText: "󰅁"
+        foreground: root.dim
+        fontFamily: root.fontFamily
+        onClicked: {
+          var presets = row.control.presets
+          var current = Number(row.control.value || 0)
+          var prev = presets[0]
+          for (var i = presets.length - 1; i >= 0; i--) {
+            if (presets[i] < current) { prev = presets[i]; break }
+          }
+          root.service.setDetail(row.deviceKey, row.control.name, prev)
+        }
+      }
 
       HSlider {
         id: track
@@ -523,6 +540,24 @@ PanelWindow {
         snap: function (raw) { return Model.snapToStep(row.control, raw) }
         onCommitted: function (v) { root.service.setDetail(row.deviceKey, row.control.name, v) }
       }
+
+      PanelActionButton {
+        visible: !!(row.control && row.control.presets && row.control.presets.length > 0)
+        anchors.verticalCenter: parent.verticalCenter
+        iconText: "󰅂"
+        foreground: root.dim
+        fontFamily: root.fontFamily
+        onClicked: {
+          var presets = row.control.presets
+          var current = Number(row.control.value || 0)
+          var nextVal = presets[presets.length - 1]
+          for (var i = 0; i < presets.length; i++) {
+            if (presets[i] > current) { nextVal = presets[i]; break }
+          }
+          root.service.setDetail(row.deviceKey, row.control.name, nextVal)
+        }
+      }
+
       Text {
         anchors.verticalCenter: parent.verticalCenter
         width: Style.space(64)
@@ -596,6 +631,12 @@ PanelWindow {
       onReleased: function (mouse) {
         slider.committed(valueAt(mouse.x))
         slider.localValue = -3e38
+      }
+      onWheel: function (wheel) {
+        var step = row.control && row.control.step ? Number(row.control.step) : 1
+        var delta = wheel.angleDelta.y > 0 ? step : -step
+        var next = Math.max(slider.min, Math.min(slider.max, slider.value + delta))
+        slider.committed(slider.snap(next))
       }
     }
   }
