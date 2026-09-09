@@ -159,6 +159,21 @@ Panel {
   property string lightingColor: ""
   property string eqPreset: "flat"
 
+  function toArray(value) {
+    if (!value) return []
+    if (Array.isArray(value)) return value
+    var out = []
+    for (var i = 0; i < value.length; i++) out.push(value[i])
+    return out
+  }
+
+  function isEqPresetActive(control, preset) {
+    if (!control) return false
+    var values = control.presetValues ? control.presetValues[preset] : null
+    if (!values || !control.value) return root.eqPreset === preset
+    return toArray(values).join(",") === toArray(control.value).join(",")
+  }
+
   function scrollItemIntoView(item) {
     if (!panelFlick || !item) return
     Qt.callLater(function () {
@@ -875,7 +890,7 @@ Panel {
           Chip {
             required property var modelData
             text: String(modelData)
-            selected: root.eqPreset === String(modelData)
+            selected: root.isEqPresetActive(row.control, String(modelData))
             onClicked: {
               root.setCursor(row.deviceKey, row.controlName)
               root.eqPreset = String(modelData)

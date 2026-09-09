@@ -128,13 +128,28 @@ RGB_EFFECTS = {
     0x17: {"slug": "ripple", "name": "Ripple", "params": ["color", "period"]},
 }
 
-EQ_PRESETS = {
+EQ_PRESETS_5 = {
     "flat": [0, 0, 0, 0, 0],
     "bass": [6, 3, 0, 0, 2],
     "vocal": [-3, 0, 4, 3, 0],
     "treble": [-2, -1, 0, 4, 6],
     "game": [4, 0, -2, 2, 5],
 }
+
+EQ_PRESETS_10 = {
+    "flat": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    "bass": [6, 5, 3, 1, 0, 0, 0, 1, 2, 2],
+    "vocal": [-3, -3, -1, 1, 4, 4, 3, 1, 0, 0],
+    "treble": [-2, -2, -1, 0, 0, 1, 3, 5, 6, 6],
+    "game": [4, 4, 1, -1, -2, 0, 2, 3, 5, 5],
+}
+
+
+def eq_presets_for(count):
+    return EQ_PRESETS_10 if count == 10 else EQ_PRESETS_5
+
+
+EQ_PRESETS = EQ_PRESETS_5
 
 BATTERY_STATUS_LABELS = {
     "FULL": "full",
@@ -497,10 +512,11 @@ def describe_control(setting, include_all=False):
         control["min"] = int(getattr(validator, "min_value", -12))
         control["max"] = int(getattr(validator, "max_value", 12))
         control["value"] = [int(v) for v in value.values()] if value else [0] * len(bands)
-        control["presets"] = sorted(EQ_PRESETS)
+        presets = eq_presets_for(len(bands))
+        control["presets"] = sorted(presets)
         # The curves themselves, so the settings window can tell "bass" from
         # a hand-tuned curve and label the latter Custom.
-        control["presetValues"] = {name: list(levels) for name, levels in EQ_PRESETS.items()}
+        control["presetValues"] = {name: list(levels) for name, levels in presets.items()}
     elif kind == int(Kind.MAP_CHOICE) and hasattr(getattr(setting, "choices", None), "items"):
         # A per-key map: each key carries its own value and its own menu of
         # NamedInt options (button assignments, key diversion).
@@ -644,8 +660,9 @@ def eq_value(setting, raw):
     current = read_value(setting) or {k: 0 for k in keys}
 
     text = str(raw).strip().lower()
-    if text in EQ_PRESETS:
-        levels = EQ_PRESETS[text]
+    presets = eq_presets_for(len(keys))
+    if text in presets:
+        levels = presets[text]
         return {k: clamp(levels[i] if i < len(levels) else 0, low, high) for i, k in enumerate(keys)}
     if "=" in text:
         band_txt, _, level = text.partition("=")
