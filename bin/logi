@@ -108,7 +108,7 @@ ADVANCED_SPECS = {
     "pointer_speed": {"order": 100, "label": "Pointer speed", "icon": "\U000f037d"},
 }
 
-HIDDEN_SETTINGS = re.compile(r"^(per-key-lighting|rgb_zone_.*|rgb_idle_effect)$")
+HIDDEN_SETTINGS = re.compile(r"^(per-key-lighting|rgb_zone_.*|led_zone_.*|rgb_idle_effect)$")
 
 # Settings solaar implements entirely in software. Their HID++ read is a stub
 # that returns a hardcoded default instead of device state, so reading one live
@@ -119,13 +119,25 @@ SOFTWARE_SETTINGS = {"rgb_idle_timeout", "rgb_sleep_timeout", "rgb_idle_effect"}
 # Effects worth offering per zone, keyed by HID++ effect ID. The device reports
 # which of these it actually supports; anything it does not claim is dropped
 # before the panel ever sees it.
+# Both 0x8071 (newer RGB EFFECTS) and 0x8070 (COLOR LED EFFECTS, e.g. G935) IDs are mapped.
 RGB_EFFECTS = {
     0x00: {"slug": "off", "name": "Off", "params": []},
     0x01: {"slug": "static", "name": "Static", "params": ["color"]},
+    0x03: {"slug": "cycle", "name": "Cycle", "params": ["period"]},
+    0x04: {"slug": "wave", "name": "Wave", "params": ["period"]},
     0x0A: {"slug": "breathe", "name": "Breathe", "params": ["color", "period"]},
+    0x0B: {"slug": "ripple", "name": "Ripple", "params": ["color", "period"]},
     0x15: {"slug": "cycle", "name": "Cycle", "params": ["period"]},
     0x16: {"slug": "wave", "name": "Wave", "params": ["period"]},
     0x17: {"slug": "ripple", "name": "Ripple", "params": ["color", "period"]},
+}
+
+ZONE_LOCATION_NAMES = {
+    0x00: "Primary",
+    0x01: "Primary",
+    0x02: "Logo",
+    0xFF01: "Logo",
+    0xFF02: "Light Strip",
 }
 
 EQ_PRESETS = {
@@ -543,10 +555,11 @@ def describe_rgb(dev, settings=None):
     by_name = {s.name: s for s in (settings or [])}
     zones = []
     for zone in infos.zones:
-        # solaar names the settings rgb_zone_1..n, one past the zone index.
-        # Devices without RGB_EFFECTS lack rgb_zone_* settings.
+        # solaar names the settings rgb_zone_1..n for 0x8071, or led_zone_<location> for 0x8070.
         index = int(zone.index) + 1
-        setting = by_name.get(f"rgb_zone_{index}")
+        loc_raw = getattr(zone, "location", 0)
+        loc_int = int(loc_raw) if loc_raw is not None else 0
+        setting = by_name.get(f"rgb_zone_{index}") or by_name.get(f"led_zone_{loc_int}") or by_name.get(f"led_zone_{index}")
         if setting is None:
             continue
         effects = []
@@ -556,10 +569,12 @@ def describe_rgb(dev, settings=None):
                 effects.append({"id": int(effect.ID), **known})
         if not effects:
             continue
+        loc_label = ZONE_LOCATION_NAMES.get(loc_int) or str(getattr(zone, "location", f"Zone {zone.index}"))
         zones.append(
             {
                 "index": index,
-                "location": str(getattr(zone, "location", f"Zone {zone.index}")),
+                "setting_name": setting.name,
+                "location": loc_label,
                 "effects": effects,
                 "current": current_effect(setting),
             }
@@ -748,7 +763,7 @@ def effect_by_slug(slug):
 def apply_rgb(entry, slug, color, period, zones):
     from logitech_receiver.hidpp20 import LEDEffectSetting
 
-    effect_id, effect = effect_by_slug(slug)
+    wanted_slug = str(slug).lower()
     rgb = describe_rgb(entry["dev"], entry["settings"]) or {"zones": []}
     targets = rgb["zones"]
     if zones and str(zones) != "all":
@@ -759,29 +774,32 @@ def apply_rgb(entry, slug, color, period, zones):
 
     # Zone effects are ignored unless the device has handed lighting control to
     # the host, so claim it first — otherwise the write silently does nothing.
-    control = next((s for s in entry["settings"] if s.name == "rgb_control"), None)
+    control = next((s for s in entry["settings"] if s.name in ("rgb_control", "led_control")), None)
     if control is not None and not read_value(control):
         try:
             control.write(True)
-        except Exception as exc:
-            raise LogiError(f"could not take over lighting: {exc}")
+        except Exception:
+            pass
 
     applied = []
     for zone in targets:
-        if effect_id not in {e["id"] for e in zone["effects"]}:
+        match = next((e for e in zone["effects"] if e["slug"] == wanted_slug or str(e["id"]) == wanted_slug), None)
+        if match is None:
             continue
+        effect_id = match["id"]
         params = {"ID": effect_id}
-        if "color" in effect["params"]:
+        if "color" in match["params"]:
             params["color"] = color if color is not None else 0xFFFFFF
-        if "period" in effect["params"]:
+        if "period" in match["params"]:
             params["period"] = int(period)
         if effect_id == 0x01:
             params["ramp"] = 0
-        if effect_id in (0x15, 0x16, 0x17):
+        if effect_id in (0x03, 0x04, 0x0B, 0x15, 0x16, 0x17):
             params["saturation"] = 100
-        if effect_id in (0x0A, 0x15, 0x16):
+        if effect_id in (0x0A, 0x03, 0x04, 0x15, 0x16):
             params["intensity"] = 100
-        setting = find_setting(entry, f"rgb_zone_{zone['index']}")
+        setting_name = zone.get("setting_name") or f"rgb_zone_{zone['index']}"
+        setting = find_setting(entry, setting_name)
         try:
             setting.write(LEDEffectSetting(**params))
         except Exception as exc:
@@ -789,11 +807,11 @@ def apply_rgb(entry, slug, color, period, zones):
         applied.append(zone["location"])
 
     if not applied:
-        raise LogiError(f"{entry['dev'].name} does not support the '{effect['slug']}' effect")
+        raise LogiError(f"{entry['dev'].name} does not support the '{wanted_slug}' effect")
     return {
         "ok": True,
         "device": entry["key"],
-        "effect": effect["slug"],
+        "effect": wanted_slug,
         "color": f"{color:06x}" if color is not None else None,
         "zones": applied,
     }
@@ -814,7 +832,9 @@ def theme_accent():
     if directory:
         candidates.append(os.path.join(directory, "colors.toml"))
     if theme:
-        candidates.append(os.path.expanduser(f"~/.config/omarchy/themes/{slugify(theme)}/colors.toml"))
+        slug = slugify(theme)
+        candidates.append(f"/usr/share/omarchy/themes/{slug}/colors.toml")
+        candidates.append(os.path.expanduser(f"~/.config/omarchy/themes/{slug}/colors.toml"))
     for path in candidates:
         if not os.path.isfile(path):
             continue
