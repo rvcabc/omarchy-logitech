@@ -28,7 +28,7 @@
     "defaults": {
       "refreshIntervalSec": 90,
       "batteryStyle": "Percent",
-      "batteryScope": "Weakest device",
+      "batteryScope": "All devices",
       "warnBelowPercent": 20
     },
     "schema": [
@@ -51,11 +51,11 @@
         "type": "enum",
         "label": "Show battery for",
         "options": [
-          "Weakest device",
-          "All devices"
+          "All devices",
+          "Weakest device"
         ],
-        "defaultValue": "Weakest device",
-        "description": "One entry for the device most likely to die first, or one per connected device."
+        "defaultValue": "All devices",
+        "description": "One glyph and indicator per connected device, or a single entry for the device most likely to die first."
       },
       {
         "key": "refreshIntervalSec",

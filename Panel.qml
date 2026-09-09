@@ -41,10 +41,10 @@ Panel {
     if (!showBatteryText && style === "percent") return "off"
     return style
   }
-  // "Weakest device" keeps the old single-entry bar; "All devices" gives every
-  // connected device its own glyph and charge indicator.
+  // "All devices" gives every connected device its own glyph and charge indicator;
+  // "Weakest device" keeps the compact single-entry bar.
   readonly property bool showAllDevices:
-    String(setting("batteryScope", "Weakest device")).toLowerCase().indexOf("all") === 0
+    String(setting("batteryScope", "All devices")).toLowerCase().indexOf("all") === 0
 
   // What the bar button actually renders: one cell per device, or a single
   // weakest-battery cell. Always at least one cell so the widget never

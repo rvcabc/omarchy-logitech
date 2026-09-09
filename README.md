@@ -100,7 +100,7 @@ settings, or inline on the widget's entry in `~/.config/omarchy/shell.json`:
 
 | Setting | Options |
 | --- | --- |
-| `batteryScope` | `Weakest device` (default) — one entry for the device most likely to die first · `All devices` — one glyph and indicator per connected device |
+| `batteryScope` | `All devices` (default) — one glyph and indicator per connected device · `Weakest device` — one entry for the device most likely to die first |
 | `batteryStyle` | `Percent` (default) — a number · `Icon` — the battery glyph ramp · `Bar` — a drawn level bar · `Battery` — a drawn outline lighting one segment per quarter charge · `Off` |
 
 ```json
