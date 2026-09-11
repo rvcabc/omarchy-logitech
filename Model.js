@@ -142,11 +142,12 @@ function hexOf(color) {
   return text.toLowerCase()
 }
 
-// Quartile fill for the drawn battery outline: no bars below 25%, one more
-// per quarter crossed, all four only when actually full.
+// Quartile fill for the drawn battery outline: each bar stands for a quarter
+// and lights once the level is nearer that quarter than the one below, so
+// 49% shows two bars, not one, and anything from 88% up shows all four.
 function batterySegments(battery) {
   if (!battery || battery.level === null || battery.level === undefined) return 0
-  return Math.max(0, Math.min(4, Math.floor(Number(battery.level) / 25)))
+  return Math.max(0, Math.min(4, Math.round(Number(battery.level) / 25)))
 }
 
 // Fill fraction for the level-bar style; null when the device reports a

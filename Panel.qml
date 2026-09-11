@@ -357,7 +357,7 @@ Panel {
             }
           }
 
-          // Battery outline with one segment lit per quarter crossed.
+          // Battery outline with one segment per quarter, lit to the nearest quarter.
           Row {
             visible: root.batteryStyle === "battery" && cell.hasLevel
             anchors.verticalCenter: parent.verticalCenter
