@@ -50,10 +50,14 @@ Panel {
   // weakest-battery cell. Always at least one cell so the widget never
   // vanishes from the bar.
   readonly property var barCells: {
-    if (showAllDevices && devices.length > 0) return devices
+    if (showAllDevices && onlineDevices.length > 0) return onlineDevices
     if (weakest) return [weakest]
-    return devices.length > 0 ? [devices[0]] : [null]
+    return onlineDevices.length > 0 ? [onlineDevices[0]] : [null]
   }
+
+  // Devices this machine can reach right now. One switched to another host
+  // keeps its card in the popup but drops out of the bar.
+  readonly property var onlineDevices: devices.filter(function (d) { return Model.isOnline(d) })
 
   // --- cursor -------------------------------------------------------------
   // One flat list of navigable rows across every device, so up/down walks the
@@ -62,6 +66,7 @@ Panel {
     var out = []
     for (var i = 0; i < devices.length; i++) {
       var device = devices[i]
+      if (!Model.isOnline(device)) continue
       for (var j = 0; j < device.controls.length; j++) {
         out.push({ key: device.key, name: device.controls[j].name, ui: device.controls[j].ui })
       }
@@ -191,7 +196,7 @@ Panel {
   readonly property var weakest: logitech.weakest
   readonly property string barGlyph: weakest ? Model.deviceGlyph(weakest) : "󰍽"
   readonly property color barIconColor: {
-    if (!logitech.connected || devices.length === 0) return Qt.darker(barForeground, 1.6)
+    if (!logitech.connected || onlineDevices.length === 0) return Qt.darker(barForeground, 1.6)
     if (logitech.anyLow) return bar ? bar.urgent : Color.urgent
     return barForeground
   }
@@ -246,7 +251,7 @@ Panel {
   // win, then a low battery goes urgent per device.
   function cellColor(device) {
     if (root.opened) return root.bar ? root.bar.urgent : Color.urgent
-    if (!logitech.connected || root.devices.length === 0) return Qt.darker(root.barForeground, 1.6)
+    if (!logitech.connected || root.onlineDevices.length === 0) return Qt.darker(root.barForeground, 1.6)
     if (device && device.battery && device.battery.low) return root.bar ? root.bar.urgent : Color.urgent
     return root.barForeground
   }
@@ -267,7 +272,7 @@ Panel {
     fixedWidth: root.verticalBar ? -1 : cellRow.implicitWidth + button.scaledHorizontalMargin * 2
     foreground: root.barIconColor
     active: root.opened
-    dimmed: !logitech.connected || root.devices.length === 0
+    dimmed: !logitech.connected || root.onlineDevices.length === 0
     tooltipText: Model.barTooltip(root.devices, logitech.connected, logitech.lastError)
 
     Row {
@@ -471,6 +476,8 @@ Panel {
               if (!logitech.connected) return "Starting device daemon…"
               if (root.devices.length === 0) return "No devices connected"
               var count = root.devices.length + (root.devices.length === 1 ? " device" : " devices")
+              var away = root.devices.length - root.onlineDevices.length
+              if (away > 0) count += " · " + away + " on another computer"
               return root.weakest ? count + " · lowest " + Model.batteryText(root.weakest.battery) : count
             }
             foreground: root.foreground
@@ -592,8 +599,12 @@ Panel {
   component DeviceSection: Rectangle {
     id: section
     property var device: null
-    readonly property var battery: device ? device.battery : null
+    readonly property bool online: Model.isOnline(device)
+    readonly property var battery: device && online ? device.battery : null
 
+    // Switched to another host: keep the card so the device does not seem to
+    // vanish, but fade it and drop controls that could not reach it anyway.
+    opacity: online ? 1.0 : 0.55
     radius: Style.cornerRadius
     color: Util.alpha(root.foreground, 0.05)
     border.width: Style.normalBorderWidth
@@ -623,6 +634,7 @@ Panel {
 
           BatteryRing {
             device: section.device
+            battery: section.battery
             Layout.alignment: Qt.AlignVCenter
           }
 
@@ -643,7 +655,10 @@ Panel {
 
             Text {
               Layout.fillWidth: true
-              text: section.device ? (section.device.via === "USB" ? "USB" : section.device.via) : ""
+              text: !section.device ? ""
+                : !section.online ? "Connected to another computer"
+                : section.device.state === "unreachable" ? section.device.via + " · not responding"
+                : section.device.via
               textFormat: Text.PlainText
               color: root.dim
               font.family: root.fontFamily
@@ -666,7 +681,7 @@ Panel {
       }
 
       Repeater {
-        model: section.device ? section.device.controls : []
+        model: section.device && section.online ? section.device.controls : []
         ControlRow {
           required property var modelData
           width: sectionBody.width
@@ -676,7 +691,7 @@ Panel {
       }
 
       LightingRow {
-        visible: !!(section.device && section.device.rgb && section.device.rgb.zones.length > 0)
+        visible: !!(section.online && section.device && section.device.rgb && section.device.rgb.zones.length > 0)
         width: sectionBody.width
         device: section.device
       }
@@ -689,7 +704,7 @@ Panel {
   component BatteryRing: Item {
     id: ring
     property var device: null
-    readonly property var battery: device ? device.battery : null
+    property var battery: device ? device.battery : null
     readonly property color tint: battery && battery.low ? root.urgent : root.foreground
     readonly property real strokeW: Math.max(2, Style.spaceReal(2))
 

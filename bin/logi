@@ -27,11 +27,14 @@ which keeps the CLI usable on its own.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import os
 import re
+import select
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -59,6 +62,13 @@ try:
     from logitech_receiver import rgb_power
 except Exception:  # pragma: no cover - solaar without software rgb power
     rgb_power = None
+
+try:
+    from logitech_receiver import base as hid_base
+    from logitech_receiver import device as hid_device
+    from logitech_receiver.hidpp20_constants import SupportedFeature
+except Exception:  # pragma: no cover - a solaar too old to name its features
+    SupportedFeature = None
 
 
 # ---------------------------------------------------------------------------
@@ -196,12 +206,28 @@ class Index:
     def __init__(self, reclaim=False):
         self.entries = []
         self.built_at = 0.0
+        # A directly connected device that answered with no settings — caught
+        # mid-connect; the daemon rebuilds again shortly rather than keep it.
+        self.incomplete = False
+        self._empty_since = {}
         self.reclaim = reclaim
         self._lock = threading.Lock()
+        self.hotplug_monitored = False
+        self._removed_paths = {}
+        self._removal_lock = threading.Lock()
+        self._removal_generation = 0
+
+    def device_removed(self, path):
+        if path:
+            with self._removal_lock:
+                self._removal_generation += 1
+                self._removed_paths[path] = self._removal_generation
 
     def rebuild(self):
         with self._lock:
             fresh = discover()
+            with self._removal_lock:
+                removed = dict(self._removed_paths)
             previous = {entry["key"]: entry for entry in self.entries}
             merged = []
             for entry in fresh:
@@ -226,22 +252,60 @@ class Index:
                     None,
                 )
                 old = previous.pop(match) if match else None
-                merged.append(old if old and old["settings"] else entry)
+                # A scan can catch a USB headset powered off while its dongle
+                # stays connected. Keep its controls if the old node is still
+                # the same and the monitor saw no removal, even if another
+                # device caused this rebuild. A removed/reused node must never
+                # inherit the old handle. Without a monitor, only receiver
+                # devices can safely keep their old entry.
+                old_path = getattr(old["dev"], "path", None) if old else None
+                unchanged = (self.hotplug_monitored and old_path
+                             and old_path == getattr(entry["dev"], "path", None)
+                             and old_path not in removed)
+                asleep = old and old["settings"] and (
+                    getattr(old["dev"], "receiver", None) is not None or unchanged
+                )
+                merged.append(old if asleep else entry)
             # rgb_power keys its managers by Device object identity, so stop
             # the managers of Device objects this rebuild just discarded —
             # otherwise every rebuild leaks one manager per lit keyboard.
+            kept = {id(entry["dev"]) for entry in merged}
             if rgb_power is not None:
-                kept = {id(entry["dev"]) for entry in merged}
                 for entry in self.entries:
                     if id(entry["dev"]) not in kept:
                         try:
                             rgb_power.stop(entry["dev"])
                         except Exception:
                             pass
+            # discover() opens a hidraw node per device, and solaar pins every
+            # Device in Device.instances: an entry the merge dropped keeps its
+            # fd open — a leak per device per rebuild, multiplied by the
+            # hotplug retries.
+            for entry in [*self.entries, *fresh]:
+                if id(entry["dev"]) not in kept:
+                    release_device(entry["dev"])
+            gc.collect()  # a dropped receiver child frees its receiver's fd too
             self.entries = merged
+            # A direct device that just stopped answering may still be
+            # connecting; the retry window covers the hotplug schedule plus
+            # quiet time. One that has been silent longer is simply off and
+            # must not send every later hotplug burst through the retries.
+            now = time.monotonic()
+            empty = {}
+            for entry in merged:
+                if entry["settings"] or getattr(entry["dev"], "receiver", None) is not None:
+                    continue
+                key = getattr(entry["dev"], "path", None) or entry["key"]
+                empty[key] = self._empty_since.get(key, now)
+            self._empty_since = empty
+            self.incomplete = any(now - first < 30 for first in empty.values())
             if self.reclaim:
                 reclaim_lighting(self.entries)
             self.built_at = time.time()
+            with self._removal_lock:
+                for path, generation in removed.items():
+                    if self._removed_paths.get(path) == generation:
+                        del self._removed_paths[path]
         return self.entries
 
     def all(self):
@@ -270,12 +334,31 @@ class Index:
         return None
 
 
+def release_device(dev):
+    """Release a Device the caller is done with, without dev.close().
+
+    solaar pins every Device it creates in Device.instances, so letting one
+    go out of scope keeps its hidraw fd open forever. close() also runs
+    cleanups, which write to the device — right for whoever configured it,
+    wrong for a duplicate handle that never did.
+    """
+    try:
+        dev.cleanups = []
+        handle, dev.handle = getattr(dev, "handle", None), None
+        if handle:
+            dev.low_level.close(handle)
+        instances = hid_device.Device.instances
+        instances[:] = [inst for inst in instances if inst is not dev]
+    except Exception:
+        pass
+
+
 def discover():
     """Every reachable device, whether plugged in directly or behind a receiver."""
     found = []
     for entry in _receivers_and_devices():
         if hasattr(entry, "settings"):
-            found.append((entry, "USB"))
+            found.append((entry, "Bluetooth" if getattr(entry, "bluetooth", False) else "USB"))
             continue
         # A receiver: its paired devices are what we actually care about.
         try:
@@ -297,7 +380,7 @@ def discover():
     # Lightspeed receiver slot. Keep one entry per physical device: prefer the
     # path that actually exposes settings, then the direct USB connection.
     def rank(entry):
-        return (1 if entry["settings"] else 0, 1 if entry["via"] == "USB" else 0)
+        return (1 if entry["settings"] else 0, 1 if entry["via"] in ("USB", "Bluetooth") else 0)
 
     best = {}
     for entry in devices:
@@ -308,8 +391,11 @@ def discover():
         if match is None:
             best[slug] = entry
         elif rank(entry) > rank(best[match]):
-            best.pop(match)
+            release_device(best.pop(match)["dev"])
             best[slug] = entry
+        else:
+            # The loser keeps its fd pinned in Device.instances otherwise.
+            release_device(entry["dev"])
 
     keep = list(best.values())
 
@@ -586,8 +672,44 @@ def current_effect(setting):
     }
 
 
-def device_payload(entry, include_all=False):
+def is_online(dev):
+    """Ask the device rather than trusting `dev.online`.
+
+    solaar starts a receiver's paired devices as online and leaves it to its
+    notification listener to say otherwise, which this backend does not run;
+    and a rebuild keeps a dozing receiver device's previous Device object.
+    Either way `dev.online` goes stale the moment a device switches to another
+    host. A ping is one HID++ round trip, fails fast for a device that is gone,
+    and recovers by itself when it comes back.
+    """
+    try:
+        return bool(dev.ping())
+    except Exception:
+        return False
+
+
+def _ping_state(dev):
+    online = is_online(dev)
+    return online, "connected" if online else "unreachable"
+
+
+def departed_payload(snapshot):
+    """The card for a device that left and has no entry any more (a Bluetooth
+    device's hidraw node goes with it)."""
+    return {
+        "key": snapshot["key"], "name": snapshot["name"], "kind": snapshot["kind"],
+        "online": False, "state": "elsewhere", "via": snapshot["via"],
+        "battery": None, "controls": [], "controllable": False,
+    }
+
+
+def device_payload(entry, include_all=False, reach=None):
+    """`reach` is (online, state) from the daemon's cache. Without one (a
+    one-shot CLI call) the device is pinged here, and a silent device is only
+    ever "unreachable": only the daemon, which saw it leave, can say "elsewhere".
+    """
     dev = entry["dev"]
+    online, state = reach if reach is not None else _ping_state(dev)
     controls = []
     for setting in entry["settings"]:
         described = describe_control(setting, include_all)
@@ -604,7 +726,10 @@ def device_payload(entry, include_all=False):
         "key": entry["key"],
         "name": dev.name,
         "kind": kind,
-        "online": bool(getattr(dev, "online", True)),
+        "online": online,
+        # connected | unreachable (silent, maybe dozing: keep its card) |
+        # elsewhere (confirmed switch to another host)
+        "state": state,
         "via": entry["via"],
         "battery": battery_of(dev),
         "controls": controls,
@@ -835,7 +960,7 @@ def theme_accent():
 # ---------------------------------------------------------------------------
 
 
-def handle(index, request):
+def handle(index, request, reach=None, departed=None):
     action = request.get("action")
 
     if action == "ping":
@@ -843,7 +968,12 @@ def handle(index, request):
 
     if action == "status":
         entries = index.rebuild() if request.get("rescan") else index.all()
-        return {"ok": True, "devices": [device_payload(e, request.get("all", False)) for e in entries]}
+        devices = [
+            device_payload(e, request.get("all", False), reach(e) if reach else None) for e in entries
+        ]
+        if departed:
+            devices += [departed_payload(snap) for snap in departed({e["key"] for e in entries})]
+        return {"ok": True, "devices": devices}
 
     if action == "set":
         entry = index.find(request["device"])
@@ -930,6 +1060,71 @@ def notify(title, body, urgency="normal"):
         pass
 
 
+# ---------------------------------------------------------------------------
+# Easy-Switch follow: when the keyboard changes host, take the mouse along
+# ---------------------------------------------------------------------------
+
+# The Easy-Switch channel keys.
+HOST_SWITCH_KEYS = (0xD1, 0xD2, 0xD3)
+
+
+def feature_index(dev, feature):
+    """Feature index, `False` when the device lacks it, `None` on error."""
+    try:
+        return dev.features[feature]
+    except Exception:
+        return None
+
+
+def report_path(dev):
+    """Receiver-paired devices may have no separate hidraw node."""
+    return getattr(dev, "path", None) or getattr(getattr(dev, "receiver", None), "path", None)
+
+
+def announce_host_switches(dev):
+    """Ask a keyboard to tell this host when an Easy-Switch key sends it away.
+
+    The MX Keys family will not divert its Easy-Switch keys, but with
+    analytics reporting set on them it sends a CHANGE_HOST notification naming
+    the target host just before it leaves. That flag lives in setCidReporting's
+    second flags byte, which solaar never sends, so the request is built here.
+    The keyboard forgets it on every reconnect, so it is set again each time.
+
+    The request goes straight to the three channel keys: reading the whole key
+    list first costs a second over Bluetooth, and a device without these keys
+    simply rejects the request. Returns how many keys took it.
+    """
+    armed = 0
+    for cid in HOST_SWITCH_KEYS:
+        try:
+            # cid, flags byte 1 (untouched), no remap, flags byte 2:
+            # analytics reporting on (0x01) plus its valid bit (0x02).
+            if dev.feature_request(SupportedFeature.REPROG_CONTROLS_V4, 0x30, *struct.pack("!HBHB", cid, 0, 0, 0x03)):
+                armed += 1
+        except Exception:
+            pass
+    return armed
+
+
+def host_switch_target(report, index, number):
+    """The host a CHANGE_HOST notification says the device is leaving for.
+
+    Observed on an MX Keys S: `01 <target>` on the CHANGE_HOST feature index,
+    function 0, software id 0 — sent just before the Bluetooth link drops.
+    """
+    if len(report) < 6 or report[0] not in (0x10, 0x11):
+        return None
+    if report[2] != index or report[3] != 0x00:
+        return None
+    if number is not None and report[1] != number:
+        return None
+    return report[5]
+
+
+def log(message):
+    print(message, file=sys.stderr, flush=True)
+
+
 class Daemon:
     """Keeps devices open so the panel gets millisecond answers.
 
@@ -937,14 +1132,36 @@ class Daemon:
     udev when pyudev is available, polled otherwise) rather than per request.
     """
 
-    def __init__(self, poll=180, notify_low=True):
+    def __init__(self, poll=180, notify_low=True, follow=True):
         self.index = Index(reclaim=True)
         self.poll = poll
         self.notify_low = notify_low
+        self.follow = follow and SupportedFeature is not None
+        # (hidraw path, device number) of every keyboard being listened to.
+        self.followers = set()
+        self.followers_lock = threading.Lock()
+        # Directly connected devices (Bluetooth, USB) opened on their own, by
+        # hidraw path — None while still being opened. Kept apart from the
+        # index, whose rebuild is slow and may hold a Device that has already
+        # gone, so a host switch always has a live handle to send through.
+        self.live = {}
+        self.live_lock = threading.Lock()
         self.warned = set()
         self.stale = threading.Event()
         self.hotplugged = threading.Event()
         self.lock = threading.Lock()
+        # Connections that asked to hear about device changes, each with its
+        # own write lock so a pushed event cannot interleave with a reply.
+        self.subscribers = {}
+        self.subscribers_lock = threading.Lock()
+        # Reachability is measured off the request path (a ping to a silent
+        # device waits out solaar's 4 s timeout) and served from this cache:
+        # key -> (online, checked_at).
+        self.reachable = {}
+        # Devices we saw leave on a confirmed Easy-Switch, key -> record.
+        # Only these are shown as "connected to another computer".
+        self.away = {}
+        self.away_lock = threading.Lock()
 
     def serve(self):
         if ask_daemon({"action": "ping"}, timeout=2.0) is not None:
@@ -960,10 +1177,15 @@ class Daemon:
         server.listen(8)
 
         self.index.rebuild()
+        self.arm_easy_switch()
+        if self.follow:
+            for info in hid_base.receivers_and_devices():
+                self.device_added(info.path)
         threading.Thread(target=self.watch_hotplug, daemon=True).start()
         threading.Thread(target=self.rebuild_after_hotplug, daemon=True).start()
         threading.Thread(target=self.watch_resume, daemon=True).start()
         threading.Thread(target=self.watch_battery, daemon=True).start()
+        threading.Thread(target=self.watch_reach, daemon=True).start()
 
         while True:
             try:
@@ -981,6 +1203,12 @@ class Daemon:
         Python interpreter start.
         """
         buffer = b""
+        write_lock = threading.Lock()
+
+        def send(payload):
+            with write_lock:
+                conn.sendall((json.dumps(payload) + "\n").encode())
+
         try:
             conn.settimeout(None)
             while True:
@@ -995,28 +1223,374 @@ class Daemon:
                 try:
                     request = json.loads(line.decode())
                 except ValueError as exc:
-                    conn.sendall((json.dumps({"ok": False, "error": f"bad request: {exc}"}) + "\n").encode())
+                    send({"ok": False, "error": f"bad request: {exc}"})
                     continue
-                response = self.answer(request)
+                if request.get("action") == "subscribe":
+                    # Opt-in only: a one-shot CLI client reads the first line
+                    # as its reply, so it must never be sent an event.
+                    with self.subscribers_lock:
+                        self.subscribers[conn] = send
+                    response = {"ok": True}
+                else:
+                    response = self.answer(request)
                 if "id" in request:
                     response["id"] = request["id"]
-                conn.sendall((json.dumps(response) + "\n").encode())
+                send(response)
         except OSError:
             pass
         finally:
+            with self.subscribers_lock:
+                self.subscribers.pop(conn, None)
             try:
                 conn.close()
             except OSError:
                 pass
+
+    def broadcast(self, event):
+        """Push an unsolicited event line to every subscribed connection."""
+        with self.subscribers_lock:
+            targets = list(self.subscribers.items())
+        for conn, send in targets:
+            try:
+                send({"event": event})
+            except OSError:
+                with self.subscribers_lock:
+                    self.subscribers.pop(conn, None)
+
+    def rebuild(self):
+        """Rebuild the index, then tell subscribers the device list moved.
+
+        Without the push the panel only learns about a device switching hosts
+        (or coming back) on its next heartbeat, up to a minute and a half later.
+        """
+        self.index.rebuild()
+        self.arm_easy_switch()
+        self.broadcast("devices-changed")
+
+    # --- Easy-Switch follow -------------------------------------------------
+
+    def device_added(self, path):
+        if not self.follow or not path:
+            return
+        with self.live_lock:
+            if path in self.live:
+                return
+            self.live[path] = None
+        threading.Thread(target=self.open_live, args=(path,), daemon=True).start()
+
+    def device_removed(self, path):
+        self.index.device_removed(path)
+        with self.live_lock:
+            dev = self.live.pop(path, None)
+        if dev is not None:
+            try:
+                dev.close()
+            except Exception:
+                pass
+
+    def open_live(self, path):
+        """Open one freshly connected device on its own, and arm it if it leads.
+
+        Waiting for the index rebuild left a keyboard back from another host
+        unarmed for ten seconds or more, or for good when the rebuild ran
+        before it answered. Opening just this hidraw node takes a fraction of
+        a second; retry on a short schedule until the device answers.
+        """
+        added = time.monotonic()
+        for delay in (0.2, 0.5, 1, 2, 4, 8):
+            time.sleep(delay)
+            with self.live_lock:
+                if path not in self.live:
+                    return  # unplugged meanwhile
+            dev = None
+            try:
+                info = next((i for i in hid_base.receivers_and_devices() if i.path == path), None)
+                if info is None or not info.isDevice:
+                    with self.live_lock:
+                        self.live.pop(path, None)
+                    return  # a receiver (the index covers its devices) or not Logitech
+                dev = hid_device.create_device(hid_base, info)
+                if dev is None:
+                    continue
+                if not dev.online:
+                    dev.close()
+                    continue
+                kind = str(dev.kind)
+            except Exception:
+                if dev is not None:
+                    try:
+                        dev.close()
+                    except Exception:
+                        pass
+                continue
+            with self.live_lock:
+                if path not in self.live:
+                    dev.close()
+                    return
+                old, self.live[path] = self.live.get(path), dev
+            if old is not None:
+                try:
+                    old.close()  # a retry replaces the handle that did not arm
+                except Exception:
+                    pass
+            if kind != "keyboard":
+                return
+            armed = self.arm(dev, path)
+            if armed is None:
+                log(f"easy-switch: {path} does not report host switches")
+                return
+            if armed:
+                log(f"easy-switch: armed {path} {(time.monotonic() - added) * 1000:.0f} ms after it appeared")
+                return
+        log(f"easy-switch: {path} never answered; it will not lead a host switch")
+
+    def arm_easy_switch(self):
+        """Arm the keyboards behind a receiver; direct ones are armed on hotplug."""
+        if not self.follow:
+            return
+        for entry in self.index.entries:
+            dev = entry["dev"]
+            try:
+                if getattr(dev, "receiver", None) is None or str(getattr(dev, "kind", "")) != "keyboard":
+                    continue
+                if not feature_index(dev, SupportedFeature.CHANGE_HOST):
+                    continue
+                if self.reach_of(entry)[0]:
+                    self.arm(dev, report_path(dev))
+            except Exception as exc:
+                # A convenience must never take the daemon down with it.
+                log(f"easy-switch: could not arm {entry['key']}: {type(exc).__name__}: {exc}")
+
+    def arm(self, dev, path):
+        """Have a keyboard announce host switches, and listen for them.
+
+        Returns True once armed, None when the device cannot report host
+        switches at all, and False when it did not take the request yet, so
+        the caller retries.
+        """
+        if not path:
+            return False
+        index = feature_index(dev, SupportedFeature.CHANGE_HOST)
+        if index is False:
+            return None
+        if index is None:
+            return False
+        if not announce_host_switches(dev):
+            return False
+        ident = (path, getattr(dev, "number", None))
+        label = slugify(dev.name)
+        with self.followers_lock:
+            if ident in self.followers:
+                return True
+            self.followers.add(ident)
+        log(f"easy-switch: listening to {label} on {path}")
+        threading.Thread(target=self.follow_keyboard, args=(label, ident, index), daemon=True).start()
+        return True
+
+    def follow_keyboard(self, source, ident, index):
+        """Read the keyboard's reports on a hidraw fd of our own.
+
+        hidraw hands every input report to every open fd, so this sees the
+        CHANGE_HOST notification without stealing replies from solaar's own
+        reads on the device. The read fails once the keyboard disconnects;
+        it is armed afresh when it comes back.
+        """
+        path, number = ident
+        # Bluetooth devices answer as 0xFF; a receiver's devices use their slot.
+        expect = None if number in (None, 0xFF) else number
+        fd = None
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            while True:
+                if not select.select([fd], [], [], 5.0)[0]:
+                    continue
+                try:
+                    report = os.read(fd, 64)
+                except BlockingIOError:
+                    continue
+                target = host_switch_target(report, index, expect)
+                if target is not None:
+                    self.follow_to(source, ident, target)
+        except OSError as exc:
+            log(f"easy-switch: stopped listening to {source} on {path}: {exc}")
+        except Exception as exc:
+            log(f"easy-switch: listener for {source} crashed: {type(exc).__name__}: {exc}")
+        finally:
+            if fd is not None:
+                os.close(fd)
+            with self.followers_lock:
+                self.followers.discard(ident)
+
+    def follow_to(self, source, ident, target):
+        """Send every other device that can change host to `target`.
+
+        Directly connected devices go first, through their own handles and
+        without the index lock, so a rebuild in progress cannot hold the mouse
+        back. A receiver's devices go through the index.
+        """
+        heard = time.monotonic()
+        moved = []
+        # The keyboard that told us it is leaving, and whatever we move along
+        # with it, are the confirmed switches. The entries list is replaced
+        # whole by a rebuild, so reading it needs no lock — and must not wait
+        # for one, or a rebuild would hold the mouse back.
+        for entry in list(self.index.entries):
+            if entry["key"] == source:
+                self.mark_away(source, entry["dev"].name, str(getattr(entry["dev"], "kind", "")), entry["via"])
+
+        def move(label, dev):
+            if not feature_index(dev, SupportedFeature.CHANGE_HOST):
+                return
+            try:
+                # setCurrentHost; the device leaves at once, so a missing
+                # reply is expected rather than a failure.
+                dev.feature_request(SupportedFeature.CHANGE_HOST, 0x10, target)
+                moved.append(f"{label} ({(time.monotonic() - heard) * 1000:.0f} ms)")
+                self.mark_away(label, dev.name, str(getattr(dev, "kind", "")), "Bluetooth" if getattr(dev, "bluetooth", False) else "USB")
+            except Exception as exc:
+                log(f"easy-switch: could not move {label}: {exc}")
+
+        with self.live_lock:
+            direct = [(slugify(dev.name), dev) for path, dev in self.live.items() if dev is not None and path != ident[0]]
+        for label, dev in direct:
+            move(label, dev)
+        behind = [
+            entry for entry in list(self.index.entries)
+            if getattr(entry["dev"], "receiver", None) is not None
+            and (report_path(entry["dev"]), getattr(entry["dev"], "number", None)) != ident
+        ]
+        if behind:
+            with self.lock:
+                for entry in behind:
+                    if self.reach_of(entry)[0]:
+                        move(entry["key"], entry["dev"])
+        log(f"easy-switch: {source} left for host {target + 1}; moved {', '.join(moved) or 'nothing'}")
+
+    # --- Reachability -------------------------------------------------------
+
+    def mark_away(self, key, name, kind, via):
+        """Record a device we watched leave for another host."""
+        with self.away_lock:
+            self.away[key] = {
+                "at": time.monotonic(), "silent": False,
+                "snapshot": {"key": key, "name": name, "kind": kind, "via": via},
+            }
+
+    def reach_of(self, entry):
+        """(online, state) for a device, from the cache — never a ping.
+
+        "elsewhere" needs evidence: we saw the device leave. A device that is
+        merely silent (a dozing receiver device, say) stays "unreachable" and
+        keeps its card, controls and battery.
+        """
+        key = entry["key"]
+        cached = self.reachable.get(key)
+        if cached is None:
+            # Not swept yet (the daemon just started, or the device just
+            # appeared). Pinging here would hold self.lock for up to 4 s on a
+            # dozing receiver device, so use solaar's flag for now and leave it
+            # uncached: the next sweep, within seconds, pings it and pushes.
+            online = bool(getattr(entry["dev"], "online", False))
+        else:
+            online = cached[0]
+        with self.away_lock:
+            if key in self.away:
+                return online, "elsewhere"
+        return online, "connected" if online else "unreachable"
+
+    def departed(self, present):
+        """Snapshots of devices that left and no longer have an index entry."""
+        with self.away_lock:
+            return [rec["snapshot"] for key, rec in self.away.items() if key not in present]
+
+    def watch_reach(self, period=5.0, bluetooth_period=15.0, receiver_period=60.0, away_limit=120.0):
+        """Refresh the reachability cache, and push when it changes.
+
+        USB devices are checked every sweep: their ping fails fast and they
+        spend no battery on it. Bluetooth devices are checked every
+        `bluetooth_period` seconds instead: each ping is radio time on their
+        battery, and a device leaving or returning is seen by udev anyway,
+        so the ping only has to notice one that is silent while connected.
+        A receiver's device is checked every minute only, since a dozing
+        one costs solaar's full 4 s timeout. This never holds the
+        daemon lock, but solaar locks per handle and every device on a
+        receiver shares that receiver's handle: while a dozing device's ping
+        waits, a request to another device on the same receiver waits too
+        (up to 4 s, once a minute). A device marked away is cleared once it
+        has gone silent and answers again, or after `away_limit` seconds if
+        it never went silent.
+        """
+        first = True
+        while True:
+            # The first sweep runs at once, so the cache fills right after start.
+            if not first:
+                time.sleep(period)
+            first = False
+            changed = False
+            now = time.monotonic()
+            entries = list(self.index.entries)
+            present = set()
+            for entry in entries:
+                key, dev = entry["key"], entry["dev"]
+                present.add(key)
+                cached = self.reachable.get(key)
+                behind_receiver = getattr(dev, "receiver", None) is not None
+                interval = (receiver_period if behind_receiver
+                            else bluetooth_period if getattr(dev, "bluetooth", False)
+                            else period)
+                if cached is not None and now - cached[1] < interval:
+                    continue
+                try:
+                    online = is_online(dev)
+                except Exception:
+                    online = False
+                # The ping can race a rebuild that dropped this entry and
+                # closed the Device's fd under it; that failure says nothing
+                # about the fresh entry now owning the key. Take the rebuild
+                # lock for the check and the write, so the result is cached
+                # only if this entry is still the one the index serves.
+                with self.index._lock:
+                    if any(e is entry for e in self.index.entries):
+                        self.reachable[key] = (online, now)
+                    else:
+                        continue
+                if (self.follow and behind_receiver and online
+                        and (cached is None or not cached[0])
+                        and str(getattr(dev, "kind", "")) == "keyboard"):
+                    try:
+                        self.arm(dev, report_path(dev))
+                    except Exception as exc:
+                        log(f"easy-switch: could not arm {key}: {type(exc).__name__}: {exc}")
+                if cached is None or cached[0] != online:
+                    changed = True
+                with self.away_lock:
+                    rec = self.away.get(key)
+                    if rec and not online:
+                        rec["silent"] = True
+            with self.away_lock:
+                for key, rec in list(self.away.items()):
+                    if key not in present:
+                        rec["silent"] = True
+                    elif rec["silent"] and self.reachable.get(key, (False,))[0]:
+                        del self.away[key]
+                        changed = True
+                    elif not rec["silent"] and now - rec["at"] > away_limit:
+                        del self.away[key]
+                        changed = True
+            for key in list(self.reachable):
+                if key not in present:
+                    del self.reachable[key]
+            if changed:
+                self.broadcast("devices-changed")
 
     def answer(self, request):
         # Device I/O is not reentrant — one request at a time.
         with self.lock:
             if self.stale.is_set():
                 self.stale.clear()
-                self.index.rebuild()
+                self.rebuild()
             try:
-                return handle(self.index, request)
+                return handle(self.index, request, self.reach_of, self.departed)
             except LogiError as exc:
                 return {"ok": False, "error": str(exc)}
             except Exception as exc:
@@ -1036,11 +1610,17 @@ class Daemon:
             context = pyudev.Context()
             monitor = pyudev.Monitor.from_netlink(context)
             monitor.filter_by(subsystem="hidraw")
+            self.index.hotplug_monitored = True
             for device in iter(monitor.poll, None):
                 if device.action in ("add", "remove"):
+                    if device.action == "add":
+                        self.device_added(device.device_node)
+                    else:
+                        self.device_removed(device.device_node)
                     self.stale.set()
                     self.hotplugged.set()
         except Exception:
+            self.index.hotplug_monitored = False
             # No pyudev, or the netlink socket went away: fall back to marking
             # the index stale periodically so a hotplug is noticed eventually.
             while True:
@@ -1061,14 +1641,26 @@ class Daemon:
             while self.hotplugged.is_set():
                 self.hotplugged.clear()
                 time.sleep(quiet)
-            with self.lock:
-                if self.stale.is_set():
+            # A device reconnecting over Bluetooth can enumerate before it
+            # answers. Retry on a short schedule instead of waiting for the
+            # panel's next request, which may be a minute and a half away.
+            for attempt, delay in enumerate((0, 3, 6, 12)):
+                time.sleep(delay)
+                if self.hotplugged.is_set():
+                    break  # a newer hotplug restarts the quiet wait
+                with self.lock:
+                    if attempt == 0 and not self.stale.is_set():
+                        break  # a request already rebuilt since the event
                     self.stale.clear()
                     try:
-                        self.index.rebuild()
-                    except Exception:
-                        # Leave it stale; the next request retries.
+                        self.rebuild()
+                    except Exception as exc:
                         self.stale.set()
+                        log(f"rebuild failed ({type(exc).__name__}: {exc}); retrying")
+                        continue
+                    if not self.index.incomplete:
+                        break
+                    log("rebuild: a device was still connecting; retrying")
 
     def watch_resume(self, period=2.0, threshold=3.0):
         """Notice the machine coming back from suspend.
@@ -1204,7 +1796,7 @@ def cmd_ping(args):
 
 
 def cmd_daemon(args):
-    Daemon(poll=args.poll, notify_low=not args.no_notify).serve()
+    Daemon(poll=args.poll, notify_low=not args.no_notify, follow=not args.no_follow).serve()
 
 
 PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -1438,6 +2030,10 @@ def main():
     p = sub.add_parser("daemon", help="hold the devices open and serve the panel")
     p.add_argument("--poll", type=int, default=180, help="battery poll interval in seconds")
     p.add_argument("--no-notify", action="store_true", help="do not warn about low batteries")
+    p.add_argument(
+        "--no-follow", action="store_true",
+        help="do not move other devices along when a keyboard's Easy-Switch key changes host",
+    )
     p.set_defaults(func=cmd_daemon)
 
     p = sub.add_parser("service", help="install or remove the daemon user service")
