@@ -214,6 +214,7 @@ journalctl --user -u omarchy-logitech -f     # what it is doing
 
 - **Zone effects do nothing until software lighting is on.** A keyboard owns
   its lighting until the host claims it, so `logi rgb` enables `rgb_control`
+  (`led_control` on COLOR_LED_EFFECTS devices such as the PRO Gaming Keyboard)
   first. Turning it back off returns the keyboard to its onboard effect.
 - **A keyboard can answer on two paths.** Plugged in over USB *and* paired to
   its Lightspeed receiver, it enumerates twice and only one path carries the

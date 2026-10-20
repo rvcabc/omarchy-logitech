@@ -82,6 +82,8 @@ CONTROL_SPECS = {
     # Keyboard
     "brightness_control": {"order": 10, "label": "Brightness", "unit": "%", "icon": "󰃞"},
     "rgb_control": {"order": 20, "label": "Software lighting", "icon": "󰌌"},
+    # The same switch on COLOR_LED_EFFECTS (0x8070) devices.
+    "led_control": {"order": 20, "label": "Software lighting", "icon": "󰌌"},
     # Both timeouts are driven by solaar's software power manager, which only
     # runs while the host holds lighting control.
     "rgb_idle_timeout": {"order": 60, "label": "Dim after", "icon": "󱎫",
@@ -108,7 +110,7 @@ ADVANCED_SPECS = {
     "pointer_speed": {"order": 100, "label": "Pointer speed", "icon": "\U000f037d"},
 }
 
-HIDDEN_SETTINGS = re.compile(r"^(per-key-lighting|rgb_zone_.*|rgb_idle_effect)$")
+HIDDEN_SETTINGS = re.compile(r"^(per-key-lighting|rgb_zone_.*|led_zone_.*|rgb_idle_effect)$")
 
 # Settings solaar implements entirely in software. Their HID++ read is a stub
 # that returns a hardcoded default instead of device state, so reading one live
@@ -118,10 +120,14 @@ SOFTWARE_SETTINGS = {"rgb_idle_timeout", "rgb_sleep_timeout", "rgb_idle_effect"}
 
 # Effects worth offering per zone, keyed by HID++ effect ID. The device reports
 # which of these it actually supports; anything it does not claim is dropped
-# before the panel ever sees it.
+# before the panel ever sees it. Devices number cycle and wave differently
+# (0x03/0x04 or 0x15/0x16), so a slug can map to two IDs; apply_rgb resolves
+# it per zone.
 RGB_EFFECTS = {
     0x00: {"slug": "off", "name": "Off", "params": []},
     0x01: {"slug": "static", "name": "Static", "params": ["color"]},
+    0x03: {"slug": "cycle", "name": "Cycle", "params": ["period"]},
+    0x04: {"slug": "wave", "name": "Wave", "params": ["period"]},
     0x0A: {"slug": "breathe", "name": "Breathe", "params": ["color", "period"]},
     0x15: {"slug": "cycle", "name": "Cycle", "params": ["period"]},
     0x16: {"slug": "wave", "name": "Wave", "params": ["period"]},
@@ -338,9 +344,10 @@ def reclaim_lighting(entries):
     """
     claimed = 0
     for entry in entries:
-        control = next((s for s in entry["settings"] if s.name == "rgb_control"), None)
+        control = next((s for s in entry["settings"] if s.name in ("rgb_control", "led_control")), None)
         if control is None:
             continue
+        zones = [s for s in entry["settings"] if s.name.startswith(("rgb_zone_", "led_zone_"))]
         # Prime the software-only settings first. The claim seeds the manager's
         # timers from their cached values, and a cached read is what pulls those
         # out of solaar's config file — without it the manager starts on its
@@ -354,15 +361,23 @@ def reclaim_lighting(entries):
         # the lighting away from the firmware and then paint nothing. That is
         # a keyboard that comes back from suspend (or boot) dark until
         # something else writes an effect.
-        for setting in entry["settings"]:
-            if setting.name.startswith("rgb_zone_"):
-                try:
-                    setting.read(True)
-                except Exception:
-                    pass
+        for setting in zones:
+            if unsaved_led_zone(setting):
+                continue
+            try:
+                setting.read(True)
+            except Exception:
+                pass
         try:
             if control.read(True) and control.write(True) is not None:
                 claimed += 1
+                # led_control is a plain register write with no repaint after
+                # it, so put the cached zone effects back by hand.
+                if control.name == "led_control":
+                    for setting in zones:
+                        value = None if unsaved_led_zone(setting) else setting.read(True)
+                        if value is not None:
+                            setting.write(value)
         except Exception:
             continue
     return claimed
@@ -412,16 +427,32 @@ def cache_only(setting):
 
     Per-key map state (diversion, remaps) is not readable back from the device
     at all; solaar tracks it in memory. The software-only rgb_* settings read
-    back a hardcoded stub. Both must come from the cache, which solaar restores
-    from its config file the first time the setting is touched.
+    back a hardcoded stub. 0x8070 zone replies start with the zone index, which
+    solaar parses as the effect, so led_zone_* reads come back shifted a byte.
+    All must come from the cache, which solaar restores from its config file
+    the first time the setting is touched.
     """
-    return setting.name in SOFTWARE_SETTINGS or int(setting.kind or 0) in (
+    return setting.name in SOFTWARE_SETTINGS or setting.name.startswith("led_zone_") or int(setting.kind or 0) in (
         int(Kind.MAP_CHOICE),
         int(Kind.MULTIPLE_TOGGLE),
     )
 
 
+def unsaved_led_zone(setting):
+    """A led_zone_* with nothing in solaar's config yet.
+
+    solaar's cached read falls through to a live read when nothing is cached,
+    and would persist that shifted reply, so treat the zone as unknown instead.
+    """
+    persister = getattr(setting._device, "persister", None)
+    return setting.name.startswith("led_zone_") and setting._value is None and (
+        persister is None or setting.name not in persister
+    )
+
+
 def read_value(setting):
+    if unsaved_led_zone(setting):
+        return None
     try:
         return setting.read(cache_only(setting))
     except Exception:
@@ -540,13 +571,16 @@ def describe_rgb(dev, settings=None):
         return None
     if not infos or not getattr(infos, "zones", None):
         return None
+    from logitech_receiver.hidpp20 import RGBEffectsInfo
+
+    # solaar names each zone setting after the zone's location, not its index:
+    # rgb_zone_<n> on RGB_EFFECTS (0x8071), led_zone_<n> on COLOR_LED_EFFECTS (0x8070).
+    prefix = "rgb_zone_" if isinstance(infos, RGBEffectsInfo) else "led_zone_"
     by_name = {s.name: s for s in (settings or [])}
     zones = []
     for zone in infos.zones:
-        # solaar names the settings rgb_zone_1..n, one past the zone index.
-        # Devices without RGB_EFFECTS lack rgb_zone_* settings.
         index = int(zone.index) + 1
-        setting = by_name.get(f"rgb_zone_{index}")
+        setting = by_name.get(f"{prefix}{int(zone.location)}")
         if setting is None:
             continue
         effects = []
@@ -559,6 +593,7 @@ def describe_rgb(dev, settings=None):
         zones.append(
             {
                 "index": index,
+                "setting": setting.name,
                 "location": str(getattr(zone, "location", f"Zone {zone.index}")),
                 "effects": effects,
                 "current": current_effect(setting),
@@ -575,6 +610,9 @@ def current_effect(setting):
     if value is None:
         return None
     effect_id = getattr(value, "ID", None)
+    if effect_id is None and getattr(value, "bytes", None):
+        # A raw 0x8070 wave (see apply_rgb): byte 0 is the zone's effect index.
+        effect_id = next((e.ID for e in setting._validator.options if e.index == value.bytes[0]), None)
     if effect_id is None:
         return None
     known = RGB_EFFECTS.get(int(effect_id))
@@ -748,7 +786,7 @@ def effect_by_slug(slug):
 def apply_rgb(entry, slug, color, period, zones):
     from logitech_receiver.hidpp20 import LEDEffectSetting
 
-    effect_id, effect = effect_by_slug(slug)
+    _, effect = effect_by_slug(slug)
     rgb = describe_rgb(entry["dev"], entry["settings"]) or {"zones": []}
     targets = rgb["zones"]
     if zones and str(zones) != "all":
@@ -759,7 +797,7 @@ def apply_rgb(entry, slug, color, period, zones):
 
     # Zone effects are ignored unless the device has handed lighting control to
     # the host, so claim it first — otherwise the write silently does nothing.
-    control = next((s for s in entry["settings"] if s.name == "rgb_control"), None)
+    control = next((s for s in entry["settings"] if s.name in ("rgb_control", "led_control")), None)
     if control is not None and not read_value(control):
         try:
             control.write(True)
@@ -768,7 +806,8 @@ def apply_rgb(entry, slug, color, period, zones):
 
     applied = []
     for zone in targets:
-        if effect_id not in {e["id"] for e in zone["effects"]}:
+        effect_id = next((e["id"] for e in zone["effects"] if e["slug"] == effect["slug"]), None)
+        if effect_id is None:
             continue
         params = {"ID": effect_id}
         if "color" in effect["params"]:
@@ -779,11 +818,20 @@ def apply_rgb(entry, slug, color, period, zones):
             params["ramp"] = 0
         if effect_id in (0x15, 0x16, 0x17):
             params["saturation"] = 100
-        if effect_id in (0x0A, 0x15, 0x16):
+        if effect_id in (0x03, 0x0A, 0x15, 0x16):
             params["intensity"] = 100
-        setting = find_setting(entry, f"rgb_zone_{zone['index']}")
+        setting = find_setting(entry, zone["setting"])
+        value = LEDEffectSetting(**params)
+        if effect_id == 0x04 and zone["setting"].startswith("led_zone_"):
+            # solaar's 0x04 layout (period at 6-7, direction at 9) is a guess the
+            # PRO Gaming Keyboard rejects with INVALID_ARGUMENT. It takes period
+            # low at 6, direction at 7, intensity at 8, period high at 9, so
+            # write raw bytes: [zone effect index] + 10 params.
+            raw = bytearray(value.to_bytes(options=setting._validator.options))
+            raw[7:11] = bytes([int(period) & 0xFF, 1, 100, (int(period) >> 8) & 0xFF])
+            value = LEDEffectSetting(bytes=bytes(raw))
         try:
-            setting.write(LEDEffectSetting(**params))
+            setting.write(value)
         except Exception as exc:
             raise LogiError(f"could not set {zone['location']} lighting: {exc}")
         applied.append(zone["location"])
@@ -1421,7 +1469,7 @@ def main():
 
     p = sub.add_parser("rgb", help="set a lighting effect")
     p.add_argument("device")
-    p.add_argument("effect", help=", ".join(e["slug"] for e in RGB_EFFECTS.values()))
+    p.add_argument("effect", help=", ".join(dict.fromkeys(e["slug"] for e in RGB_EFFECTS.values())))
     p.add_argument("--color", default=None, help="hex color, e.g. 2bb3e6")
     p.add_argument("--period", type=int, default=5000, help="animation period in ms")
     p.add_argument("--zone", default="all")

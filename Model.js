@@ -114,10 +114,6 @@ function snapToStep(control, value) {
   return Math.max(min, Math.min(max, snapped))
 }
 
-function zoneSettingName(zone) {
-  return "rgb_zone_" + zone.index
-}
-
 function effectLabel(effect) {
   return effect && effect.name ? effect.name : ""
 }
