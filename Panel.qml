@@ -74,6 +74,8 @@ Panel {
 
   property int selectedIndex: 0
   property bool cursorActive: false
+  // The hex field owns the keyboard while it has focus.
+  property bool editingColor: false
 
   function rowIndex(key, name) {
     for (var i = 0; i < rows.length; i++) {
@@ -434,6 +436,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      blocked: root.editingColor
       onMoveRequested: function (dx, dy) {
         if (!root.cursorActive) { root.cursorActive = true; return }
         root.moveCursor(dx, dy)
@@ -951,6 +954,32 @@ Panel {
       ? device.rgb.zones[0].current : null
     readonly property string activeEffect: current && current.slug ? current.slug : root.lightingEffect
     readonly property string activeColor: current && current.color ? "#" + current.color : root.lightingColor
+    property bool picking: false
+    readonly property bool customColor: !Model.swatches(logitech.accent).some(function (s) {
+      return Model.hexOf(s.color) === Model.hexOf(lighting.activeColor)
+    })
+
+    Connections {
+      target: root
+      function onOpenedChanged() { if (root.opened) lighting.picking = false }
+    }
+
+    // Swatches, the hue strip and the hex field all land here. Only
+    // color-bearing effects can show a color; nudge the effect to Static so a
+    // pick always does something visible.
+    function applyColor(color) {
+      root.lightingColor = color
+      var slug = lighting.activeEffect
+      var supportsColor = slug === "static" || slug === "breathe" || slug === "ripple"
+      if (!supportsColor) slug = "static"
+      root.lightingEffect = slug
+      logitech.setLighting(lighting.deviceKey, slug, color)
+    }
+
+    function closePicker() {
+      picking = false
+      Qt.callLater(function () { keyCatcher.forceActiveFocus() })
+    }
 
     hasCursor: root.hasCursorAt(deviceKey, "__lighting")
     foreground: root.foreground
@@ -1056,18 +1085,101 @@ Panel {
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
               onEntered: root.setCursor(lighting.deviceKey, "__lighting")
-              onClicked: {
-                root.lightingColor = modelData.color
-                // Only color-bearing effects can show a swatch; nudge the
-                // effect to Static so a click always does something visible.
-                var slug = lighting.activeEffect
-                var supportsColor = slug === "static" || slug === "breathe" || slug === "ripple"
-                if (!supportsColor) slug = "static"
-                root.lightingEffect = slug
-                logitech.setLighting(lighting.deviceKey, slug, modelData.color)
-              }
+              onClicked: lighting.applyColor(modelData.color)
             }
           }
+        }
+
+        // Any other color: opens the hue strip and hex field below.
+        Rectangle {
+          width: Style.space(18)
+          height: Style.space(18)
+          radius: Style.cornerRadius > 0 ? width / 2 : 0
+          gradient: Gradient {
+            orientation: Gradient.Horizontal
+            GradientStop { position: 0.0; color: "#ff0000" }
+            GradientStop { position: 0.5; color: "#00ff00" }
+            GradientStop { position: 1.0; color: "#0000ff" }
+          }
+          border.width: lighting.picking || lighting.customColor ? Style.normalBorderWidth * 2 : Style.normalBorderWidth
+          border.color: lighting.picking || lighting.customColor ? root.foreground
+            : Util.alpha(root.foreground, customMouse.containsMouse ? 0.7 : 0.35)
+          scale: customMouse.containsMouse ? 1.12 : 1
+
+          Behavior on scale { NumberAnimation { duration: 100; easing.type: Easing.OutCubic } }
+
+          MouseArea {
+            id: customMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onEntered: root.setCursor(lighting.deviceKey, "__lighting")
+            onClicked: {
+              if (lighting.picking) {
+                lighting.closePicker()
+                return
+              }
+              lighting.picking = true
+              hexField.text = Model.hexOf(lighting.activeColor)
+              Qt.callLater(function () { hexField.forceActiveFocus() })
+            }
+          }
+        }
+      }
+
+      RowLayout {
+        visible: lighting.picking
+        Layout.fillWidth: true
+        spacing: Style.space(8)
+
+        Rectangle {
+          id: hueStrip
+          Layout.fillWidth: true
+          Layout.preferredHeight: Style.space(18)
+          radius: Style.cornerRadius > 0 ? height / 2 : 0
+          gradient: Gradient {
+            orientation: Gradient.Horizontal
+            GradientStop { position: 0 / 6; color: "#ff0000" }
+            GradientStop { position: 1 / 6; color: "#ffff00" }
+            GradientStop { position: 2 / 6; color: "#00ff00" }
+            GradientStop { position: 3 / 6; color: "#00ffff" }
+            GradientStop { position: 4 / 6; color: "#0000ff" }
+            GradientStop { position: 5 / 6; color: "#ff00ff" }
+            GradientStop { position: 1; color: "#ff0000" }
+          }
+
+          function colorAt(x) {
+            return String(Qt.hsva(Math.max(0, Math.min(x / width, 1)), 1, 1, 1))
+          }
+
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            // Track the drag in the hex field and write once on release, like
+            // the sliders: every write is a HID++ round trip.
+            onPositionChanged: function (mouse) { hexField.text = Model.hexOf(hueStrip.colorAt(mouse.x)) }
+            onReleased: function (mouse) { lighting.applyColor(hueStrip.colorAt(mouse.x)) }
+          }
+        }
+
+        TextField {
+          id: hexField
+          Layout.preferredWidth: Style.space(84)
+          foreground: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          verticalPadding: Style.space(2)
+          placeholderText: "ff0000"
+          maximumLength: 7
+          validator: RegularExpressionValidator { regularExpression: /#?[0-9a-fA-F]{0,6}/ }
+          onAccepted: {
+            var hex = Model.hexOf(text)
+            if (hex.length !== 6) return
+            lighting.applyColor("#" + hex)
+            lighting.closePicker()
+          }
+          Keys.onEscapePressed: lighting.closePicker()
+          onActiveFocusChanged: root.editingColor = activeFocus
         }
       }
     }

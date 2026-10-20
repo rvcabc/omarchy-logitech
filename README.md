@@ -90,7 +90,8 @@ effect first, if you want that.
 Inside the panel: `r` rescans, `t` matches the theme, arrows walk the rows,
 left/right adjusts whatever is selected, Enter activates it. Host switching
 takes a deliberate Enter or click — arrow keys will not hand your mouse to
-another machine by accident.
+another machine by accident. The last lighting swatch opens a hue strip and a
+hex field for any color the presets miss.
 
 The bar button shows battery for whichever device has the least left and turns
 urgent below 20%. The daemon raises one notification per discharge cycle.
