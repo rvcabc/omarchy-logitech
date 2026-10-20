@@ -806,7 +806,8 @@ def theme_accent():
             ["omarchy", "theme", "current"], capture_output=True, text=True, timeout=5
         ).stdout.strip()
         directory = subprocess.run(
-            ["omarchy", "theme", "dir", theme], capture_output=True, text=True, timeout=5
+            # `theme current` prints the display name ("Tokyo Night"); `theme dir` wants the slug.
+            ["omarchy", "theme", "dir", slugify(theme)], capture_output=True, text=True, timeout=5
         ).stdout.strip()
     except Exception:
         return None

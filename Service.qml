@@ -393,7 +393,7 @@ Item {
     running: true
     command: ["sh", "-c",
       "sed -n 's/^ *accent *= *\"\\?#\\?\\([0-9a-fA-F]\\{6\\}\\).*/\\1/p' " +
-      "\"$(omarchy theme dir \"$(omarchy theme current)\" 2>/dev/null)/colors.toml\" 2>/dev/null | head -1"]
+      "\"$(omarchy theme dir \"$(omarchy theme current | tr 'A-Z ' 'a-z-')\" 2>/dev/null)/colors.toml\" 2>/dev/null | head -1"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
