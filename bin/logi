@@ -428,6 +428,20 @@ def read_value(setting):
         return None
 
 
+def slider_number(value):
+    """Collapse a scalar RANGE/CHOICE value to a plain number.
+
+    A few RANGE settings (e.g. the MX Master's `force-sensing`) read back as a
+    single-entry dict like {0: 5548} rather than a bare int. A slider wants the
+    number, so unwrap a one-entry dict; anything else dict-shaped we can't map to
+    one point, so treat as absent.
+    """
+    if isinstance(value, dict):
+        values = list(value.values())
+        return values[0] if len(values) == 1 else None
+    return value
+
+
 def named_choice(setting, value):
     """The choice matching `value`, so the panel gets a label it can match.
 
@@ -479,7 +493,8 @@ def describe_control(setting, include_all=False):
             control["min"] = numbers[0]
             control["max"] = numbers[-1]
             control["step"] = numbers[1] - numbers[0] if len(numbers) > 1 else 1
-            control["value"] = int(value) if value is not None else numbers[0]
+            number = slider_number(value)
+            control["value"] = int(number) if number is not None else numbers[0]
         else:
             control["ui"] = "choice"
     elif kind == int(Kind.RANGE):
@@ -488,7 +503,8 @@ def describe_control(setting, include_all=False):
         control["min"] = int(low)
         control["max"] = int(high)
         control["step"] = max(1, (int(high) - int(low)) // 20)
-        control["value"] = int(value) if value is not None else int(low)
+        number = slider_number(value)
+        control["value"] = int(number) if number is not None else int(low)
     elif kind == int(Kind.PACKED_RANGE):
         validator = setting._validator
         bands = [str(k) for k in (getattr(validator, "keys", None) or [])]
@@ -624,7 +640,8 @@ def device_payload(entry, include_all=False):
 def readback(setting):
     value = read_value(setting)
     if isinstance(value, dict):
-        return [int(v) for v in value.values()]
+        values = [int(v) for v in value.values()]
+        return values[0] if len(values) == 1 else values
     if isinstance(value, bool):
         return value
     if value is None:
@@ -667,6 +684,25 @@ def eq_value(setting, raw):
     return {k: clamp(levels[i] if i < len(levels) else 0, low, high) for i, k in enumerate(keys)}
 
 
+def ensure_persister_slot(setting):
+    """Seed a keyed setting's persister dict before writing it.
+
+    A keyed RANGE (e.g. `force-sensing`, read as {0: 5548}) writes through
+    `persister[name][key] = value`, which assumes `persister[name]` is already a
+    dict. For a setting never written before, that slot is absent and solaar
+    raises KeyError(name). Settings that were read or set earlier already have
+    it, so this only fills the gap on a first write.
+    """
+    try:
+        persister = getattr(setting._device, "persister", None)
+        if persister is None or setting.name in persister:
+            return
+        if isinstance(read_value(setting), dict):
+            persister[setting.name] = {}
+    except Exception:
+        pass
+
+
 def write_setting(entry, name, raw, item=None):
     setting = find_setting(entry, name)
     kind = int(setting.kind or 0)
@@ -683,6 +719,7 @@ def write_setting(entry, name, raw, item=None):
             value = eq_value(setting, raw)
         else:
             raise LogiError(f"'{name}' is not a setting this plugin knows how to write")
+        ensure_persister_slot(setting)
         setting.write(value)
     except LogiError:
         raise
